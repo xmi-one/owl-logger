@@ -37,9 +37,8 @@ async fn main() {
     owl_logger::info!("所有请求处理完成");
 }
 
+#[owl_logger::monitor]
 async fn handle_request(id: u32) {
-    owl_logger::info!(request_id = id, "开始处理请求");
-
     // 模拟异步操作
     tokio::time::sleep(std::time::Duration::from_millis(100 * id as u64)).await;
 
@@ -52,6 +51,4 @@ async fn handle_request(id: u32) {
     }
     .instrument(owl_logger::info_span!("db_query", table = "orders"))
     .await;
-
-    owl_logger::info!(request_id = id, "请求处理完成");
 }

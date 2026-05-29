@@ -53,6 +53,7 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &input.sig;
     let body = &input.block;
     let return_type = &input.sig.output;
+    let is_async = input.sig.asyncness.is_some();
 
     // 收集参数名和格式化
     let param_formats = build_param_formats(&input.sig.inputs, &skip_fields);
@@ -115,10 +116,32 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    let body_call = if has_return {
-        quote! { let __owl_result = { #body }; }
+    let body_call = if is_async {
+        if has_return {
+            quote! {
+                let __owl_result = async move {
+                    #body
+                }.await;
+            }
+        } else {
+            quote! {
+                async move {
+                    #body
+                }.await;
+            }
+        }
+    } else if has_return {
+        quote! {
+            let __owl_result = (|| {
+                #body
+            })();
+        }
     } else {
-        quote! { { #body } }
+        quote! {
+            (|| {
+                #body
+            })();
+        }
     };
 
     let expanded = quote! {
