@@ -23,6 +23,8 @@ pub struct OwlFormatter {
     pub(crate) show_thread: bool,
     pub(crate) show_line_number: bool,
     pub(crate) enable_ansi: bool,
+    pub(crate) time_format: String,
+    pub(crate) use_utc: bool,
 }
 
 impl OwlFormatter {
@@ -46,8 +48,11 @@ impl OwlFormatter {
 
     /// 格式化时间戳
     fn format_timestamp(&self) -> String {
-        let now = chrono::Local::now();
-        let ts = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let ts = if self.use_utc {
+            chrono::Utc::now().format(&self.time_format).to_string()
+        } else {
+            chrono::Local::now().format(&self.time_format).to_string()
+        };
         if self.enable_ansi {
             ts.dimmed().to_string()
         } else {
@@ -176,6 +181,8 @@ pub(crate) fn file_formatter(language: Language, config: &crate::config::OwlConf
         show_thread: config.show_thread,
         show_line_number: config.show_line_number,
         enable_ansi: false, // 文件输出不带颜色
+        time_format: config.time_format.clone(),
+        use_utc: config.use_utc,
     }
 }
 
@@ -187,5 +194,7 @@ pub(crate) fn console_formatter(language: Language, config: &crate::config::OwlC
         show_thread: config.show_thread,
         show_line_number: config.show_line_number,
         enable_ansi: config.enable_ansi,
+        time_format: config.time_format.clone(),
+        use_utc: config.use_utc,
     }
 }

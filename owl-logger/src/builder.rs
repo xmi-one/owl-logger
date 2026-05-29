@@ -132,6 +132,30 @@ impl OwlLoggerBuilder {
         self
     }
 
+    /// 设置时间戳格式字符串（基于 chrono format 语法）
+    ///
+    /// 默认值：`"%Y-%m-%d %H:%M:%S%.3f"`（带 3 位毫秒精度）
+    pub fn time_format(mut self, format: impl Into<String>) -> Self {
+        self.config.time_format = format.into();
+        self
+    }
+
+    /// 设置是否使用 UTC 时区代替本地时区
+    ///
+    /// 默认值：`false`（使用本地时区）
+    pub fn utc(mut self, use_utc: bool) -> Self {
+        self.config.use_utc = use_utc;
+        self
+    }
+
+    /// 设置最大日志文件保留数量（超过时自动清理最旧的日志文件）
+    ///
+    /// 默认值：`None`（不限制）
+    pub fn max_files(mut self, max_files: usize) -> Self {
+        self.config.max_files = Some(max_files);
+        self
+    }
+
     /// 构建并初始化全局日志 subscriber
     ///
     /// 返回 `OwlGuard`，必须在 `main()` 中持有以确保日志不丢失。
@@ -200,19 +224,42 @@ impl OwlLoggerBuilder {
 
             let file_writer: Box<dyn std::io::Write + Send + Sync + 'static> = match &config.rotation {
                 RotationPolicy::Daily => {
-                    Box::new(tracing_appender::rolling::daily(&config.log_dir, &config.file_name))
+                    let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
+                        .rotation(tracing_appender::rolling::Rotation::DAILY)
+                        .filename_prefix(&config.file_name)
+                        .filename_suffix("log");
+                    if let Some(max_files) = config.max_files {
+                        builder = builder.max_log_files(max_files);
+                    }
+                    Box::new(builder.build(&config.log_dir).unwrap())
                 }
                 RotationPolicy::Hourly => {
-                    Box::new(tracing_appender::rolling::hourly(&config.log_dir, &config.file_name))
+                    let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
+                        .rotation(tracing_appender::rolling::Rotation::HOURLY)
+                        .filename_prefix(&config.file_name)
+                        .filename_suffix("log");
+                    if let Some(max_files) = config.max_files {
+                        builder = builder.max_log_files(max_files);
+                    }
+                    Box::new(builder.build(&config.log_dir).unwrap())
                 }
                 RotationPolicy::SizeMB(mb) => {
-                    Box::new(SizeRotatingFileWriter::new(&config.log_dir, &config.file_name, *mb))
+                    Box::new(SizeRotatingFileWriter::new(
+                        &config.log_dir,
+                        &config.file_name,
+                        *mb,
+                        config.max_files,
+                    ))
                 }
                 RotationPolicy::Never => {
-                    Box::new(tracing_appender::rolling::never(
-                        &config.log_dir,
-                        format!("{}.log", &config.file_name),
-                    ))
+                    let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
+                        .rotation(tracing_appender::rolling::Rotation::NEVER)
+                        .filename_prefix(&config.file_name)
+                        .filename_suffix("log");
+                    if let Some(max_files) = config.max_files {
+                        builder = builder.max_log_files(max_files);
+                    }
+                    Box::new(builder.build(&config.log_dir).unwrap())
                 }
             };
 
@@ -286,16 +333,23 @@ struct SizeRotatingFileWriter {
     log_dir: std::path::PathBuf,
     file_name: String,
     max_size: u64,
+    max_files: Option<usize>,
     current_file: Option<std::fs::File>,
     current_size: u64,
 }
 
 impl SizeRotatingFileWriter {
-    pub fn new(log_dir: impl Into<std::path::PathBuf>, file_name: impl Into<String>, max_size_mb: u64) -> Self {
+    pub fn new(
+        log_dir: impl Into<std::path::PathBuf>,
+        file_name: impl Into<String>,
+        max_size_mb: u64,
+        max_files: Option<usize>,
+    ) -> Self {
         Self {
             log_dir: log_dir.into(),
             file_name: file_name.into(),
             max_size: max_size_mb * 1024 * 1024,
+            max_files,
             current_file: None,
             current_size: 0,
         }
@@ -324,14 +378,40 @@ impl SizeRotatingFileWriter {
 
         let file_path = self.log_dir.join(format!("{}.log", self.file_name));
         if file_path.exists() {
-            let mut index = 1;
-            loop {
-                let backup_path = self.log_dir.join(format!("{}.{}.log", self.file_name, index));
-                if !backup_path.exists() {
-                    std::fs::rename(&file_path, &backup_path)?;
-                    break;
+            if let Some(max_files) = self.max_files {
+                if max_files > 1 {
+                    let n = max_files - 1;
+                    // 1. 删除最老的一个备份文件 app.N-1.log
+                    let oldest_path = self.log_dir.join(format!("{}.{}.log", self.file_name, n));
+                    if oldest_path.exists() {
+                        let _ = std::fs::remove_file(oldest_path);
+                    }
+                    // 2. 依次将 app.i.log 顺延重命名为 app.i+1.log
+                    for i in (1..n).rev() {
+                        let src = self.log_dir.join(format!("{}.{}.log", self.file_name, i));
+                        let dest = self.log_dir.join(format!("{}.{}.log", self.file_name, i + 1));
+                        if src.exists() {
+                            std::fs::rename(src, dest)?;
+                        }
+                    }
+                    // 3. 将当前的 app.log 重命名为 app.1.log
+                    let dest = self.log_dir.join(format!("{}.1.log", self.file_name));
+                    std::fs::rename(&file_path, dest)?;
+                } else {
+                    // max_files == 1: 直接删除当前日志文件，不保存备份
+                    let _ = std::fs::remove_file(&file_path);
                 }
-                index += 1;
+            } else {
+                // 不限制最大文件数量，寻找下一个空闲索引
+                let mut index = 1;
+                loop {
+                    let backup_path = self.log_dir.join(format!("{}.{}.log", self.file_name, index));
+                    if !backup_path.exists() {
+                        std::fs::rename(&file_path, &backup_path)?;
+                        break;
+                    }
+                    index += 1;
+                }
             }
         }
 

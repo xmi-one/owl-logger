@@ -1,6 +1,6 @@
 [package]
 name = "owl-logger"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.70.0"
 description = "A production-ready, ergonomic logging library for Rust — inspired by Python's xmi_logger, powered by tracing."
@@ -17,7 +17,7 @@ tracing-appender = "0.2"
 tracing-log = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 owo-colors = "4"
-owl-logger-macros = { path = "../owl-logger-macros", version = "0.1.1" }
+owl-logger-macros = { path = "../owl-logger-macros", version = "0.1.2" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -108,6 +108,12 @@ pub struct OwlConfig {
     pub show_thread: bool,
     /// 是否显示源码行号
     pub show_line_number: bool,
+    /// 时间戳格式化字符串
+    pub time_format: String,
+    /// 是否使用 UTC 时区
+    pub use_utc: bool,
+    /// 最大日志文件保留数
+    pub max_files: Option<usize>,
 }
 
 impl Default for OwlConfig {
@@ -125,6 +131,9 @@ impl Default for OwlConfig {
             show_target: true,
             show_thread: false,
             show_line_number: false,
+            time_format: "%Y-%m-%d %H:%M:%S%.3f".to_string(),
+            use_utc: false,
+            max_files: None,
         }
     }
 }
