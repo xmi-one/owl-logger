@@ -21,3 +21,4 @@ owl-logger-macros = { path = "../owl-logger-macros", version = "0.1.0" }
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
+log = "0.4"
