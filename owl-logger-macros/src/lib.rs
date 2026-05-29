@@ -48,7 +48,6 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let fn_name = &input.sig.ident;
     let fn_name_str = fn_name.to_string();
-    let is_async = input.sig.asyncness.is_some();
     let vis = &input.vis;
     let fn_attrs = &input.attrs;
     let sig = &input.sig;
@@ -71,12 +70,43 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let exit_log = if has_return {
         quote! {
-            tracing::event!(#level_token, "← exiting {}({}) — elapsed {:.2?} — returned {:?}", #fn_name_str, #param_formats, __owl_elapsed, __owl_result);
+            let __owl_lang = owl_logger::__private::get_language();
+            let __owl_exiting = owl_logger::__private::I18n::exiting_function(__owl_lang);
+            let __owl_elapsed_label = owl_logger::__private::I18n::elapsed(__owl_lang);
+            let __owl_returned_label = owl_logger::__private::I18n::returned(__owl_lang);
+            tracing::event!(
+                #level_token,
+                "{} {}({}) — {} {:.2?} — {} {:?}",
+                __owl_exiting,
+                #fn_name_str,
+                #param_formats,
+                __owl_elapsed_label,
+                __owl_elapsed,
+                __owl_returned_label,
+                __owl_result
+            );
         }
     } else {
         quote! {
-            tracing::event!(#level_token, "← exiting {}({}) — elapsed {:.2?}", #fn_name_str, #param_formats, __owl_elapsed);
+            let __owl_lang = owl_logger::__private::get_language();
+            let __owl_exiting = owl_logger::__private::I18n::exiting_function(__owl_lang);
+            let __owl_elapsed_label = owl_logger::__private::I18n::elapsed(__owl_lang);
+            tracing::event!(
+                #level_token,
+                "{} {}({}) — {} {:.2?}",
+                __owl_exiting,
+                #fn_name_str,
+                #param_formats,
+                __owl_elapsed_label,
+                __owl_elapsed
+            );
         }
+    };
+
+    let entering_log = quote! {
+        let __owl_lang = owl_logger::__private::get_language();
+        let __owl_entering = owl_logger::__private::I18n::entering_function(__owl_lang);
+        tracing::event!(#level_token, "{} {}({})", __owl_entering, #fn_name_str, #param_formats);
     };
 
     let return_expr = if has_return {
@@ -91,29 +121,15 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { { #body } }
     };
 
-    let expanded = if is_async {
-        quote! {
-            #(#fn_attrs)*
-            #vis #sig {
-                tracing::event!(#level_token, "→ entering {}({})", #fn_name_str, #param_formats);
-                let __owl_start = std::time::Instant::now();
-                #body_call
-                let __owl_elapsed = __owl_start.elapsed();
-                #exit_log
-                #return_expr
-            }
-        }
-    } else {
-        quote! {
-            #(#fn_attrs)*
-            #vis #sig {
-                tracing::event!(#level_token, "→ entering {}({})", #fn_name_str, #param_formats);
-                let __owl_start = std::time::Instant::now();
-                #body_call
-                let __owl_elapsed = __owl_start.elapsed();
-                #exit_log
-                #return_expr
-            }
+    let expanded = quote! {
+        #(#fn_attrs)*
+        #vis #sig {
+            #entering_log
+            let __owl_start = std::time::Instant::now();
+            #body_call
+            let __owl_elapsed = __owl_start.elapsed();
+            #exit_log
+            #return_expr
         }
     };
 

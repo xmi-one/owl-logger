@@ -113,3 +113,29 @@ pub fn init() -> OwlGuard {
 pub fn try_init() -> Result<OwlGuard, OwlError> {
     builder().try_init()
 }
+
+/// 仅供过程宏内部使用的私有 API
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::i18n::I18n;
+    pub use crate::config::Language;
+    
+    use std::sync::atomic::{AtomicU8, Ordering};
+    
+    static CURRENT_LANG: AtomicU8 = AtomicU8::new(0); // 0 = En, 1 = Zh
+    
+    pub fn set_language(lang: Language) {
+        let val = match lang {
+            Language::En => 0,
+            Language::Zh => 1,
+        };
+        CURRENT_LANG.store(val, Ordering::SeqCst);
+    }
+    
+    pub fn get_language() -> Language {
+        match CURRENT_LANG.load(Ordering::SeqCst) {
+            1 => Language::Zh,
+            _ => Language::En,
+        }
+    }
+}

@@ -145,7 +145,25 @@ where
         }
 
         // 日志消息和结构化字段
-        ctx.format_fields(writer.by_ref(), event)?;
+        let mut fields_buf = String::new();
+        ctx.format_fields(
+            tracing_subscriber::fmt::format::Writer::new(&mut fields_buf),
+            event,
+        )?;
+
+        if self.enable_ansi {
+            let level = event.metadata().level();
+            let colored_fields = match *level {
+                Level::ERROR => fields_buf.red().bold().to_string(),
+                Level::WARN => fields_buf.yellow().to_string(),
+                Level::INFO => fields_buf,
+                Level::DEBUG => fields_buf.dimmed().to_string(),
+                Level::TRACE => fields_buf.dimmed().to_string(),
+            };
+            write!(writer, "{}", colored_fields)?;
+        } else {
+            write!(writer, "{}", fields_buf)?;
+        }
         writeln!(writer)
     }
 }

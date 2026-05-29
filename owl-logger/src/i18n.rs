@@ -6,7 +6,7 @@ use crate::config::Language;
 ///
 /// 提供日志级别名称、系统提示语等的多语言支持。
 #[allow(dead_code)]
-pub(crate) struct I18n;
+pub struct I18n;
 
 #[allow(dead_code)]
 impl I18n {
@@ -58,6 +58,14 @@ impl I18n {
         match lang {
             Language::Zh => "耗时",
             Language::En => "elapsed",
+        }
+    }
+
+    /// 返回值提示
+    pub fn returned(lang: Language) -> &'static str {
+        match lang {
+            Language::Zh => "返回值",
+            Language::En => "returned",
         }
     }
 }

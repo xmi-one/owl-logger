@@ -219,6 +219,9 @@ impl OwlLoggerBuilder {
         // 桥接 log crate
         tracing_log::LogTracer::init().ok();
 
+        // 设置全局语言状态供 #[monitor] 宏查询
+        crate::__private::set_language(config.language);
+
         // 打印初始化成功消息
         tracing::info!("{}", I18n::init_message(config.language));
 
