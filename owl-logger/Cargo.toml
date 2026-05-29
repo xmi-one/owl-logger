@@ -1,0 +1,23 @@
+[package]
+name = "owl-logger"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70.0"
+description = "A production-ready, ergonomic logging library for Rust — inspired by Python's xmi_logger, powered by tracing."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xmi-one/owl-logger"
+keywords = ["logging", "tracing", "logger", "structured-logging"]
+categories = ["development-tools::debugging"]
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "registry"] }
+tracing-appender = "0.2"
+tracing-log = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+owo-colors = "4"
+owl-logger-macros = { path = "../owl-logger-macros", version = "0.1.0" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

@@ -1,0 +1,115 @@
+//! # 🦉 owl-logger
+//!
+//! **开箱即用、生产级、Rust 风格的日志库**
+//!
+//! 基于 `tracing` 生态构建，借鉴 Python `xmi_logger` 的设计理念，
+//! 提供简洁的 API 和丰富的功能。
+//!
+//! ## 快速开始
+//!
+//! ```rust,no_run
+//! let _guard = owl_logger::init();
+//!
+//! tracing::info!("Hello from owl-logger! 🦉");
+//! tracing::warn!(user = "alice", "Something needs attention");
+//! tracing::error!("Oops, something went wrong");
+//! ```
+//!
+//! ## 自定义配置
+//!
+//! ```rust,no_run
+//! use owl_logger::{Language, LogLevel, RotationPolicy};
+//!
+//! let _guard = owl_logger::builder()
+//!     .file_name("my_app")
+//!     .log_dir("logs")
+//!     .language(Language::Zh)
+//!     .level(LogLevel::Debug)
+//!     .rotation(RotationPolicy::Daily)
+//!     .init();
+//!
+//! tracing::info!("🦉 开始工作！");
+//! ```
+//!
+//! ## 请求上下文追踪
+//!
+//! ```rust,no_run
+//! let _guard = owl_logger::init();
+//!
+//! // 同步上下文
+//! let _ctx = owl_logger::context::with_request_id("req-001");
+//! tracing::info!("处理订单"); // 日志自动带上 req_id="req-001"
+//! ```
+//!
+//! ## 重要提示
+//!
+//! `init()` 和 `builder().init()` 返回的 `OwlGuard` **必须被持有**（通常用 `let _guard = ...`）。
+//! 当 Guard 被丢弃时，会自动 flush 所有缓冲的日志。如果不持有 Guard，日志可能会丢失。
+
+mod builder;
+mod config;
+pub mod context;
+mod error;
+mod formatter;
+mod guard;
+mod i18n;
+
+// ===== 公开 API =====
+
+pub use builder::OwlLoggerBuilder;
+pub use config::{Language, LogLevel, OutputFormat, RotationPolicy};
+pub use error::OwlError;
+pub use guard::OwlGuard;
+
+// Re-export 过程宏
+pub use owl_logger_macros::monitor;
+
+// Re-export tracing 核心宏，方便用户不必额外 `use tracing`
+pub use tracing::{debug, error, info, trace, warn};
+pub use tracing::{debug_span, error_span, info_span, trace_span, warn_span};
+pub use tracing::instrument;
+pub use tracing::Instrument;
+
+/// 创建一个新的 Builder 实例
+///
+/// # 示例
+///
+/// ```rust,no_run
+/// let _guard = owl_logger::builder()
+///     .file_name("app")
+///     .language(owl_logger::Language::Zh)
+///     .init();
+/// ```
+pub fn builder() -> OwlLoggerBuilder {
+    OwlLoggerBuilder::new()
+}
+
+/// 零配置一键初始化
+///
+/// 使用默认配置初始化日志系统：
+/// - 控制台 + 文件双输出
+/// - Info 级别
+/// - 英文
+/// - Pretty 格式
+/// - Daily 文件轮转
+///
+/// # 示例
+///
+/// ```rust,no_run
+/// let _guard = owl_logger::init();
+/// tracing::info!("ready!");
+/// ```
+///
+/// # Panics
+///
+/// 如果全局 subscriber 已经被设置，将会 panic。
+pub fn init() -> OwlGuard {
+    builder().init()
+}
+
+/// 尝试零配置初始化（不 panic）
+///
+/// 与 `init()` 相同，但失败时返回 `Err` 而非 panic。
+pub fn try_init() -> Result<OwlGuard, OwlError> {
+    builder().try_init()
+}

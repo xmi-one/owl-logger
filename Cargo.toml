@@ -1,0 +1,3 @@
+[workspace]
+members = ["owl-logger", "owl-logger-macros"]
+resolver = "2"
