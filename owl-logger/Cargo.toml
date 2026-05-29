@@ -6,6 +6,7 @@ rust-version = "1.70.0"
 description = "A production-ready, ergonomic logging library for Rust — inspired by Python's xmi_logger, powered by tracing."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xmi-one/owl-logger"
+readme = "README.md"
 keywords = ["logging", "tracing", "logger", "structured-logging"]
 categories = ["development-tools::debugging"]
 

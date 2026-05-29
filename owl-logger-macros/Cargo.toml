@@ -6,6 +6,7 @@ rust-version = "1.70.0"
 description = "Procedural macros for owl-logger — #[monitor] attribute macro for automatic function instrumentation."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xmi-one/owl-logger"
+readme = "README.md"
 
 [lib]
 proc-macro = true
