@@ -154,7 +154,7 @@ fn main() {
 | `.global_field(k, v)` | - | 全局属性字段，会自动平铺附加在每条日志中 |
 | `.sensitive_key(key)` | - | 追加单个脱敏词（如密码、Token 字段名） |
 | `.sensitive_keys(keys)` | - | 重新覆盖脱敏词列表 |
-| `.retention_days(days)` | `None` | 日志过期天数（后台定期清理） |
+| `.retention_days(days)` | `Some(7)` | 日志过期天数（后台定期清理，默认保留 7 天） |
 | `.buffered_lines_limit(n)` | `120_000` | 异步非阻塞缓冲队列行数限制 |
 | `.lossy(bool)` | `true` | 队列写满时是否丢弃（`false` 会阻塞当前线程保证防丢失） |
 | `.console(bool)` | `true` | 是否启用控制台（Stderr）输出 |

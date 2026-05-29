@@ -155,7 +155,7 @@ impl Default for OwlConfig {
                 "authorization".to_string(),
                 "credit_card".to_string(),
             ],
-            retention_days: None,
+            retention_days: Some(7),
             buffered_lines_limit: 120_000,
             lossy: true,
         }
