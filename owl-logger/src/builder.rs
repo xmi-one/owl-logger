@@ -198,22 +198,25 @@ impl OwlLoggerBuilder {
             std::fs::create_dir_all(&config.log_dir)
                 .map_err(OwlError::LogDirCreation)?;
 
-            let file_appender = match &config.rotation {
+            let file_writer: Box<dyn std::io::Write + Send + Sync + 'static> = match &config.rotation {
                 RotationPolicy::Daily => {
-                    tracing_appender::rolling::daily(&config.log_dir, &config.file_name)
+                    Box::new(tracing_appender::rolling::daily(&config.log_dir, &config.file_name))
                 }
                 RotationPolicy::Hourly => {
-                    tracing_appender::rolling::hourly(&config.log_dir, &config.file_name)
+                    Box::new(tracing_appender::rolling::hourly(&config.log_dir, &config.file_name))
                 }
-                RotationPolicy::SizeMB(_) | RotationPolicy::Never => {
-                    tracing_appender::rolling::never(
+                RotationPolicy::SizeMB(mb) => {
+                    Box::new(SizeRotatingFileWriter::new(&config.log_dir, &config.file_name, *mb))
+                }
+                RotationPolicy::Never => {
+                    Box::new(tracing_appender::rolling::never(
                         &config.log_dir,
                         format!("{}.log", &config.file_name),
-                    )
+                    ))
                 }
             };
 
-            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_writer);
             file_guard = Some(guard);
 
             let layer = match config.format {
@@ -275,5 +278,91 @@ impl OwlLoggerBuilder {
 impl Default for OwlLoggerBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 支持按文件大小限制自动轮转的自定义文件写入器
+struct SizeRotatingFileWriter {
+    log_dir: std::path::PathBuf,
+    file_name: String,
+    max_size: u64,
+    current_file: Option<std::fs::File>,
+    current_size: u64,
+}
+
+impl SizeRotatingFileWriter {
+    pub fn new(log_dir: impl Into<std::path::PathBuf>, file_name: impl Into<String>, max_size_mb: u64) -> Self {
+        Self {
+            log_dir: log_dir.into(),
+            file_name: file_name.into(),
+            max_size: max_size_mb * 1024 * 1024,
+            current_file: None,
+            current_size: 0,
+        }
+    }
+
+    fn init_file(&mut self) -> std::io::Result<&mut std::fs::File> {
+        if self.current_file.is_some() {
+            return Ok(self.current_file.as_mut().unwrap());
+        }
+
+        let file_path = self.log_dir.join(format!("{}.log", self.file_name));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file_path)?;
+
+        let metadata = file.metadata()?;
+        self.current_size = metadata.len();
+        self.current_file = Some(file);
+
+        Ok(self.current_file.as_mut().unwrap())
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        self.current_file = None;
+
+        let file_path = self.log_dir.join(format!("{}.log", self.file_name));
+        if file_path.exists() {
+            let mut index = 1;
+            loop {
+                let backup_path = self.log_dir.join(format!("{}.{}.log", self.file_name, index));
+                if !backup_path.exists() {
+                    std::fs::rename(&file_path, &backup_path)?;
+                    break;
+                }
+                index += 1;
+            }
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&file_path)?;
+
+        self.current_size = 0;
+        self.current_file = Some(file);
+        Ok(())
+    }
+}
+
+impl std::io::Write for SizeRotatingFileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.init_file()?;
+        if self.current_size + buf.len() as u64 > self.max_size {
+            self.rotate()?;
+        }
+        let file = self.current_file.as_mut().unwrap();
+        let written = file.write(buf)?;
+        self.current_size += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(ref mut file) = self.current_file {
+            file.flush()?;
+        }
+        Ok(())
     }
 }
