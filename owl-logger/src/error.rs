@@ -9,6 +9,10 @@ pub enum OwlError {
     LogDirCreation(std::io::Error),
     /// 环境过滤器解析失败
     EnvFilter(String),
+    /// 动态修改日志过滤器/级别失败
+    Reload(String),
+    /// 日志系统未初始化
+    NotInitialized,
     /// 其他错误
     Other(String),
 }
@@ -25,12 +29,19 @@ impl fmt::Display for OwlError {
             OwlError::EnvFilter(e) => {
                 write!(f, "owl-logger: invalid env filter: {e}")
             }
+            OwlError::Reload(e) => {
+                write!(f, "owl-logger: failed to reload log filter: {e}")
+            }
+            OwlError::NotInitialized => {
+                write!(f, "owl-logger: logger not initialized")
+            }
             OwlError::Other(msg) => {
                 write!(f, "owl-logger: {msg}")
             }
         }
     }
 }
+
 
 impl std::error::Error for OwlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {

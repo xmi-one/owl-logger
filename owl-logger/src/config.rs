@@ -114,6 +114,18 @@ pub struct OwlConfig {
     pub use_utc: bool,
     /// 最大日志文件保留数
     pub max_files: Option<usize>,
+    /// 是否捕获 Panic 并通过日志输出
+    pub catch_panic: bool,
+    /// 全局常量字段（会自动附加到每条日志）
+    pub global_fields: std::collections::HashMap<String, String>,
+    /// 敏感字段名列表（包含的字段内容会被自动脱敏为 [MASKED]）
+    pub sensitive_keys: Vec<String>,
+    /// 日志保留天数（超过此天数的日志文件会被自动清理）
+    pub retention_days: Option<usize>,
+    /// 异步非阻塞队列的容量限制
+    pub buffered_lines_limit: usize,
+    /// 队列满时是否允许丢弃日志（false 则阻塞当前线程）
+    pub lossy: bool,
 }
 
 impl Default for OwlConfig {
@@ -134,6 +146,19 @@ impl Default for OwlConfig {
             time_format: "%Y-%m-%d %H:%M:%S%.3f".to_string(),
             use_utc: false,
             max_files: None,
+            catch_panic: true,
+            global_fields: std::collections::HashMap::new(),
+            sensitive_keys: vec![
+                "password".to_string(),
+                "token".to_string(),
+                "secret".to_string(),
+                "authorization".to_string(),
+                "credit_card".to_string(),
+            ],
+            retention_days: None,
+            buffered_lines_limit: 120_000,
+            lossy: true,
         }
     }
 }
+

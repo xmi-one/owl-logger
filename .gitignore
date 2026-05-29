@@ -18,6 +18,7 @@ Cargo.lock
 
 # 日志输出
 logs/
+logs_advanced/
 
 # 调试文件
 *.pdb

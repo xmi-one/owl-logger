@@ -114,6 +114,34 @@ pub fn try_init() -> Result<OwlGuard, OwlError> {
     builder().try_init()
 }
 
+/// 动态获取当前的日志过滤器规则
+pub fn get_filter() -> Result<String, OwlError> {
+    if let Some(handle) = crate::builder::RELOAD_HANDLE.get() {
+        Ok(handle.with_current(|filter| filter.to_string()).unwrap_or_default())
+    } else {
+        Err(OwlError::NotInitialized)
+    }
+}
+
+/// 动态更新全局日志过滤器规则 (例如 "info,my_crate=debug")
+pub fn set_filter(filter_str: impl AsRef<str>) -> Result<(), OwlError> {
+    if let Some(handle) = crate::builder::RELOAD_HANDLE.get() {
+        let filter_str = filter_str.as_ref();
+        let new_filter = tracing_subscriber::EnvFilter::try_new(filter_str)
+            .map_err(|e| OwlError::EnvFilter(e.to_string()))?;
+        handle.reload(new_filter)
+            .map_err(|e| OwlError::Reload(e.to_string()))?;
+        Ok(())
+    } else {
+        Err(OwlError::NotInitialized)
+    }
+}
+
+/// 动态更新全局日志级别
+pub fn set_level(level: LogLevel) -> Result<(), OwlError> {
+    set_filter(level.to_string())
+}
+
 /// 仅供过程宏内部使用的私有 API
 #[doc(hidden)]
 pub mod __private {
@@ -138,4 +166,52 @@ pub mod __private {
             _ => Language::En,
         }
     }
+
+    // 用于 #[monitor] 宏的 Autoref 特化检测工具，自动识别 Result::Err 返回值
+    pub struct OwlWrap<T>(pub T);
+
+    #[derive(Debug, Clone)]
+    pub struct OwlResultInfo {
+        pub is_err: bool,
+        pub level_override: Option<tracing::Level>,
+        pub error_msg: Option<String>,
+    }
+
+    pub trait OwlLowPriority {
+        fn owl_inspect(&self) -> OwlResultInfo;
+    }
+
+    impl<T> OwlLowPriority for &OwlWrap<T> {
+        #[inline]
+        fn owl_inspect(&self) -> OwlResultInfo {
+            OwlResultInfo {
+                is_err: false,
+                level_override: None,
+                error_msg: None,
+            }
+        }
+    }
+
+    pub trait OwlHighPriority {
+        fn owl_inspect(&self) -> OwlResultInfo;
+    }
+
+    impl<T, E: std::fmt::Debug> OwlHighPriority for OwlWrap<&Result<T, E>> {
+        #[inline]
+        fn owl_inspect(&self) -> OwlResultInfo {
+            match self.0 {
+                Ok(_) => OwlResultInfo {
+                    is_err: false,
+                    level_override: None,
+                    error_msg: None,
+                },
+                Err(e) => OwlResultInfo {
+                    is_err: true,
+                    level_override: Some(tracing::Level::ERROR),
+                    error_msg: Some(format!("{:?}", e)),
+                },
+            }
+        }
+    }
 }
+

@@ -1,50 +1,19 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, FnArg, ItemFn, Pat, ReturnType};
+use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
+use syn::{parse_macro_input, FnArg, Ident, ItemFn, Meta, MetaList, MetaNameValue, Pat, ReturnType, Token};
 
 /// # `#[monitor]` — 函数监控宏
 ///
 /// 自动为函数注入入口/出口日志和执行耗时统计。
-/// 借鉴 Python xmi_logger 的 `@log_decorator()` 装饰器。
-///
-/// ## 基础用法
-///
-/// ```rust,ignore
-/// #[owl_logger::monitor]
-/// fn process_order(order_id: &str, amount: f64) -> bool {
-///     // 业务逻辑...
-///     true
-/// }
-/// // 自动输出：
-/// // INFO → entering process_order(order_id="ORD-001", amount=99.9)
-/// // INFO ← exiting process_order — elapsed 1.23ms — returned true
-/// ```
-///
-/// ## 异步函数
-///
-/// ```rust,ignore
-/// #[owl_logger::monitor]
-/// async fn fetch_data(url: &str) -> Result<String, Error> {
-///     // ...
-/// }
-/// ```
-///
-/// ## 自定义级别和跳过参数
-///
-/// ```rust,ignore
-/// #[owl_logger::monitor(level = "debug", skip(password))]
-/// fn login(username: &str, password: &str) -> bool {
-///     true
-/// }
-/// ```
+/// 如果函数返回 Result 且为 Err，将自动升级日志级别为 ERROR，并附带错误详情。
 #[proc_macro_attribute]
 pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
-    let attrs = attr.to_string();
-
-    // 解析属性参数
-    let level = parse_level(&attrs);
-    let skip_fields = parse_skip(&attrs);
+    
+    // 使用 syn 解析宏属性参数
+    let args = parse_macro_input!(attr as MonitorArgs);
 
     let fn_name = &input.sig.ident;
     let fn_name_str = fn_name.to_string();
@@ -56,10 +25,11 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let is_async = input.sig.asyncness.is_some();
 
     // 收集参数名和格式化
-    let param_formats = build_param_formats(&input.sig.inputs, &skip_fields);
+    let param_formats = build_param_formats(&input.sig.inputs, &args.skip);
 
     // 构建日志级别的 token
-    let level_token = match level.as_str() {
+    let level_str = args.level.unwrap_or_else(|| "info".to_string());
+    let level_token = match level_str.as_str() {
         "trace" => quote! { tracing::Level::TRACE },
         "debug" => quote! { tracing::Level::DEBUG },
         "warn" => quote! { tracing::Level::WARN },
@@ -75,17 +45,39 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
             let __owl_exiting = owl_logger::__private::I18n::exiting_function(__owl_lang);
             let __owl_elapsed_label = owl_logger::__private::I18n::elapsed(__owl_lang);
             let __owl_returned_label = owl_logger::__private::I18n::returned(__owl_lang);
-            tracing::event!(
-                #level_token,
-                "{} {}({}) — {} {:.2?} — {} {:?}",
-                __owl_exiting,
-                #fn_name_str,
-                #param_formats,
-                __owl_elapsed_label,
-                __owl_elapsed,
-                __owl_returned_label,
-                __owl_result
-            );
+            
+            // 使用 autoref 特化在运行期动态判定是否为 Err 并自动升级日志级别
+            #[allow(unused_imports)]
+            use owl_logger::__private::{OwlLowPriority, OwlHighPriority};
+            let __owl_result_info = (&owl_logger::__private::OwlWrap(&__owl_result)).owl_inspect();
+
+            if __owl_result_info.is_err {
+                let __owl_error_detail = __owl_result_info.error_msg.as_deref().unwrap_or("unknown error");
+                tracing::event!(
+                    target: "monitor",
+                    tracing::Level::ERROR,
+                    "{} {}({}) — {} {:.2?} — ERROR: {}",
+                    __owl_exiting,
+                    #fn_name_str,
+                    #param_formats,
+                    __owl_elapsed_label,
+                    __owl_elapsed,
+                    __owl_error_detail
+                );
+            } else {
+                tracing::event!(
+                    target: "monitor",
+                    #level_token,
+                    "{} {}({}) — {} {:.2?} — {} {:?}",
+                    __owl_exiting,
+                    #fn_name_str,
+                    #param_formats,
+                    __owl_elapsed_label,
+                    __owl_elapsed,
+                    __owl_returned_label,
+                    __owl_result
+                );
+            }
         }
     } else {
         quote! {
@@ -93,6 +85,7 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
             let __owl_exiting = owl_logger::__private::I18n::exiting_function(__owl_lang);
             let __owl_elapsed_label = owl_logger::__private::I18n::elapsed(__owl_lang);
             tracing::event!(
+                target: "monitor",
                 #level_token,
                 "{} {}({}) — {} {:.2?}",
                 __owl_exiting,
@@ -107,7 +100,14 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let entering_log = quote! {
         let __owl_lang = owl_logger::__private::get_language();
         let __owl_entering = owl_logger::__private::I18n::entering_function(__owl_lang);
-        tracing::event!(#level_token, "{} {}({})", __owl_entering, #fn_name_str, #param_formats);
+        tracing::event!(
+            target: "monitor",
+            #level_token,
+            "{} {}({})",
+            __owl_entering,
+            #fn_name_str,
+            #param_formats
+        );
     };
 
     let return_expr = if has_return {
@@ -159,36 +159,59 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-/// 解析 level 参数，如 `level = "debug"`
-fn parse_level(attrs: &str) -> String {
-    if let Some(pos) = attrs.find("level") {
-        let rest = &attrs[pos..];
-        if let Some(start) = rest.find('"') {
-            let rest = &rest[start + 1..];
-            if let Some(end) = rest.find('"') {
-                return rest[..end].to_lowercase();
+/// 过程宏属性参数
+struct MonitorArgs {
+    level: Option<String>,
+    skip: Vec<String>,
+}
+
+impl Parse for MonitorArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut level = None;
+        let mut skip = Vec::new();
+
+        if input.is_empty() {
+            return Ok(MonitorArgs { level, skip });
+        }
+
+        let nested = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
+        for meta in nested {
+            match meta {
+                Meta::NameValue(MetaNameValue { path, value, .. }) => {
+                    if path.is_ident("level") {
+                        if let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(lit_str), .. }) = value {
+                            level = Some(lit_str.value().to_lowercase());
+                        } else {
+                            return Err(syn::Error::new_spanned(value, "level must be a string literal, e.g., level = \"debug\""));
+                        }
+                    } else {
+                        return Err(syn::Error::new_spanned(path, "unknown argument, supported: level, skip"));
+                    }
+                }
+                Meta::List(MetaList { path, tokens, .. }) => {
+                    if path.is_ident("skip") {
+                        let idents = syn::parse::Parser::parse2(
+                            Punctuated::<Ident, Token![,]>::parse_terminated,
+                            tokens,
+                        )?;
+                        for ident in idents {
+                            skip.push(ident.to_string());
+                        }
+                    } else {
+                        return Err(syn::Error::new_spanned(path, "unknown argument, supported: level, skip"));
+                    }
+                }
+                Meta::Path(path) => {
+                    return Err(syn::Error::new_spanned(path, "unknown argument style"));
+                }
             }
         }
+
+        Ok(MonitorArgs { level, skip })
     }
-    "info".to_string()
 }
 
-/// 解析 skip 参数列表，如 `skip(password, secret)`
-fn parse_skip(attrs: &str) -> Vec<String> {
-    if let Some(pos) = attrs.find("skip(") {
-        let rest = &attrs[pos + 5..];
-        if let Some(end) = rest.find(')') {
-            return rest[..end]
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-        }
-    }
-    Vec::new()
-}
-
-/// 构建参数格式化字符串
+/// 构建参数格式化代码
 fn build_param_formats(
     inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
     skip_fields: &[String],
@@ -222,4 +245,3 @@ fn build_param_formats(
         }
     }
 }
-

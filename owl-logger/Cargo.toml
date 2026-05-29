@@ -17,7 +17,11 @@ tracing-appender = "0.2"
 tracing-log = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 owo-colors = "4"
+flate2 = "1.0"
+serde_json = "1.0"
 owl-logger-macros = { path = "../owl-logger-macros", version = "0.1.2" }
+
+
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
