@@ -26,8 +26,8 @@ pub struct OwlGuard {
 
 impl Drop for OwlGuard {
     fn drop(&mut self) {
-        // 打印清理提示（直接输出到 stderr 避免通过已关闭的 subscriber）
-        eprintln!("{}", I18n::cleanup_message(self.language));
+        // 打印清理提示
+        tracing::info!("{}", I18n::cleanup_message(self.language));
         // WorkerGuard 的 Drop 实现会自动 flush 所有缓冲日志
     }
 }
