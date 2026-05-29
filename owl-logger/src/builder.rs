@@ -163,13 +163,32 @@ impl OwlLoggerBuilder {
             let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
             console_guard = Some(guard);
 
-            let fmt = formatter::console_formatter(config.language, &config);
-            Some(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(non_blocking)
-                    .event_format(fmt)
-                    .with_ansi(config.enable_ansi),
-            )
+            let layer = match config.format {
+                OutputFormat::Json => {
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(non_blocking)
+                        .json()
+                        .with_span_list(true)
+                        .with_ansi(config.enable_ansi)
+                        .boxed()
+                }
+                OutputFormat::Compact => {
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(non_blocking)
+                        .compact()
+                        .with_ansi(config.enable_ansi)
+                        .boxed()
+                }
+                OutputFormat::Pretty => {
+                    let fmt = formatter::console_formatter(config.language, &config);
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(non_blocking)
+                        .event_format(fmt)
+                        .with_ansi(config.enable_ansi)
+                        .boxed()
+                }
+            };
+            Some(layer)
         } else {
             None
         };
@@ -197,13 +216,32 @@ impl OwlLoggerBuilder {
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
             file_guard = Some(guard);
 
-            let fmt = formatter::file_formatter(config.language, &config);
-            Some(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(non_blocking)
-                    .event_format(fmt)
-                    .with_ansi(false),
-            )
+            let layer = match config.format {
+                OutputFormat::Json => {
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(non_blocking)
+                        .json()
+                        .with_span_list(true)
+                        .with_ansi(false)
+                        .boxed()
+                }
+                OutputFormat::Compact => {
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(non_blocking)
+                        .compact()
+                        .with_ansi(false)
+                        .boxed()
+                }
+                OutputFormat::Pretty => {
+                    let fmt = formatter::file_formatter(config.language, &config);
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(non_blocking)
+                        .event_format(fmt)
+                        .with_ansi(false)
+                        .boxed()
+                }
+            };
+            Some(layer)
         } else {
             None
         };
@@ -214,7 +252,8 @@ impl OwlLoggerBuilder {
             .with(env_filter)
             .with(console_layer)
             .with(file_layer)
-            .init();
+            .try_init()
+            .map_err(|_| OwlError::AlreadyInitialized)?;
 
         // 桥接 log crate
         tracing_log::LogTracer::init().ok();
