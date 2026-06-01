@@ -9,7 +9,7 @@ use crate::i18n::I18n;
 
 /// 全局日志过滤器重载句柄，用于在运行期修改日志过滤器级别
 pub(crate) static RELOAD_HANDLE: std::sync::OnceLock<
-    tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>
+    tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>,
 > = std::sync::OnceLock::new();
 
 /// 自定义时间戳格式化器，实现 tracing_subscriber 的 FormatTime
@@ -42,6 +42,26 @@ impl OwlLoggerBuilder {
         Self {
             config: OwlConfig::default(),
         }
+    }
+
+    /// 从环境变量创建 Builder
+    pub fn from_env() -> Result<Self, OwlError> {
+        let mut builder = Self::new();
+
+        if let Ok(level) = std::env::var("OWL_LOG_LEVEL") {
+            builder = builder.level(parse_log_level(&level)?);
+        }
+        if let Ok(format) = std::env::var("OWL_LOG_FORMAT") {
+            builder = builder.format(parse_output_format(&format)?);
+        }
+        if let Ok(log_dir) = std::env::var("OWL_LOG_DIR") {
+            builder = builder.log_dir(log_dir);
+        }
+        if let Ok(file_name) = std::env::var("OWL_LOG_FILE") {
+            builder = builder.file_name(file_name);
+        }
+
+        Ok(builder)
     }
 
     /// 设置日志文件名前缀（不含扩展名）
@@ -205,10 +225,11 @@ impl OwlLoggerBuilder {
 
         // 构建控制台输出层
         let console_layer = if config.enable_console {
-            let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
-                .buffered_lines_limit(config.buffered_lines_limit)
-                .lossy(config.lossy)
-                .finish(std::io::stderr());
+            let (non_blocking, guard) =
+                tracing_appender::non_blocking::NonBlockingBuilder::default()
+                    .buffered_lines_limit(config.buffered_lines_limit)
+                    .lossy(config.lossy)
+                    .finish(std::io::stderr());
             console_guard = Some(guard);
 
             let layer = match config.format {
@@ -227,14 +248,12 @@ impl OwlLoggerBuilder {
                         .event_format(json_fmt)
                         .boxed()
                 }
-                OutputFormat::Compact => {
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(non_blocking)
-                        .compact()
-                        .with_timer(timer)
-                        .with_ansi(config.enable_ansi)
-                        .boxed()
-                }
+                OutputFormat::Compact => tracing_subscriber::fmt::layer()
+                    .with_writer(non_blocking)
+                    .compact()
+                    .with_timer(timer)
+                    .with_ansi(config.enable_ansi)
+                    .boxed(),
                 OutputFormat::Pretty => {
                     let fmt = formatter::console_formatter(config.language, &config);
                     tracing_subscriber::fmt::layer()
@@ -251,60 +270,75 @@ impl OwlLoggerBuilder {
 
         // 构建文件输出层
         let file_layer = if config.enable_file {
-            std::fs::create_dir_all(&config.log_dir)
-                .map_err(OwlError::LogDirCreation)?;
+            std::fs::create_dir_all(&config.log_dir).map_err(OwlError::LogDirCreation)?;
 
             // 启动时先清理一次过期日志
             if let Some(retention_days) = config.retention_days {
-                cleanup_old_logs(std::path::Path::new(&config.log_dir), &config.file_name, retention_days);
+                cleanup_old_logs(
+                    std::path::Path::new(&config.log_dir),
+                    &config.file_name,
+                    retention_days,
+                );
             }
 
-            let file_writer: Box<dyn std::io::Write + Send + Sync + 'static> = match &config.rotation {
-                RotationPolicy::Daily => {
-                    let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
-                        .rotation(tracing_appender::rolling::Rotation::DAILY)
-                        .filename_prefix(&config.file_name)
-                        .filename_suffix("log");
-                    if let Some(max_files) = config.max_files {
-                        builder = builder.max_log_files(max_files);
+            let file_writer: Box<dyn std::io::Write + Send + Sync + 'static> =
+                match &config.rotation {
+                    RotationPolicy::Daily => {
+                        let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
+                            .rotation(tracing_appender::rolling::Rotation::DAILY)
+                            .filename_prefix(&config.file_name)
+                            .filename_suffix("log");
+                        if let Some(max_files) = config.max_files {
+                            builder = builder.max_log_files(max_files);
+                        }
+                        Box::new(
+                            builder
+                                .build(&config.log_dir)
+                                .map_err(|e| OwlError::FileAppenderCreation(e.to_string()))?,
+                        )
                     }
-                    Box::new(builder.build(&config.log_dir).unwrap())
-                }
-                RotationPolicy::Hourly => {
-                    let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
-                        .rotation(tracing_appender::rolling::Rotation::HOURLY)
-                        .filename_prefix(&config.file_name)
-                        .filename_suffix("log");
-                    if let Some(max_files) = config.max_files {
-                        builder = builder.max_log_files(max_files);
+                    RotationPolicy::Hourly => {
+                        let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
+                            .rotation(tracing_appender::rolling::Rotation::HOURLY)
+                            .filename_prefix(&config.file_name)
+                            .filename_suffix("log");
+                        if let Some(max_files) = config.max_files {
+                            builder = builder.max_log_files(max_files);
+                        }
+                        Box::new(
+                            builder
+                                .build(&config.log_dir)
+                                .map_err(|e| OwlError::FileAppenderCreation(e.to_string()))?,
+                        )
                     }
-                    Box::new(builder.build(&config.log_dir).unwrap())
-                }
-                RotationPolicy::SizeMB(mb) => {
-                    Box::new(SizeRotatingFileWriter::new(
+                    RotationPolicy::SizeMB(mb) => Box::new(SizeRotatingFileWriter::new(
                         &config.log_dir,
                         &config.file_name,
                         *mb,
                         config.max_files,
                         config.retention_days,
-                    ))
-                }
-                RotationPolicy::Never => {
-                    let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
-                        .rotation(tracing_appender::rolling::Rotation::NEVER)
-                        .filename_prefix(&config.file_name)
-                        .filename_suffix("log");
-                    if let Some(max_files) = config.max_files {
-                        builder = builder.max_log_files(max_files);
+                    )),
+                    RotationPolicy::Never => {
+                        let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
+                            .rotation(tracing_appender::rolling::Rotation::NEVER)
+                            .filename_prefix(&config.file_name)
+                            .filename_suffix("log");
+                        if let Some(max_files) = config.max_files {
+                            builder = builder.max_log_files(max_files);
+                        }
+                        Box::new(
+                            builder
+                                .build(&config.log_dir)
+                                .map_err(|e| OwlError::FileAppenderCreation(e.to_string()))?,
+                        )
                     }
-                    Box::new(builder.build(&config.log_dir).unwrap())
-                }
-            };
+                };
 
-            let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
-                .buffered_lines_limit(config.buffered_lines_limit)
-                .lossy(config.lossy)
-                .finish(file_writer);
+            let (non_blocking, guard) =
+                tracing_appender::non_blocking::NonBlockingBuilder::default()
+                    .buffered_lines_limit(config.buffered_lines_limit)
+                    .lossy(config.lossy)
+                    .finish(file_writer);
             file_guard = Some(guard);
 
             let timer = OwlTime {
@@ -328,14 +362,12 @@ impl OwlLoggerBuilder {
                         .event_format(json_fmt)
                         .boxed()
                 }
-                OutputFormat::Compact => {
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(non_blocking)
-                        .compact()
-                        .with_timer(timer)
-                        .with_ansi(false)
-                        .boxed()
-                }
+                OutputFormat::Compact => tracing_subscriber::fmt::layer()
+                    .with_writer(non_blocking)
+                    .compact()
+                    .with_timer(timer)
+                    .with_ansi(false)
+                    .boxed(),
                 OutputFormat::Pretty => {
                     let fmt = formatter::file_formatter(config.language, &config);
                     tracing_subscriber::fmt::layer()
@@ -352,7 +384,6 @@ impl OwlLoggerBuilder {
 
         // 包装 reloadable filter 层
         let (env_filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
-        RELOAD_HANDLE.set(reload_handle).map_err(|_| OwlError::AlreadyInitialized)?;
 
         // 初始化全局注册表
         tracing_subscriber::registry()
@@ -360,6 +391,9 @@ impl OwlLoggerBuilder {
             .with(console_layer)
             .with(file_layer)
             .try_init()
+            .map_err(|_| OwlError::AlreadyInitialized)?;
+        RELOAD_HANDLE
+            .set(reload_handle)
             .map_err(|_| OwlError::AlreadyInitialized)?;
 
         // 桥接 log crate
@@ -369,7 +403,8 @@ impl OwlLoggerBuilder {
         if config.catch_panic {
             let default_hook = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |panic_info| {
-                let location = panic_info.location()
+                let location = panic_info
+                    .location()
                     .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
                     .unwrap_or_else(|| "unknown".to_string());
 
@@ -411,11 +446,9 @@ impl OwlLoggerBuilder {
         if let Some(retention_days) = config.retention_days {
             let log_dir = std::path::PathBuf::from(&config.log_dir);
             let file_name = config.file_name.clone();
-            std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(3600));
-                    cleanup_old_logs(&log_dir, &file_name, retention_days);
-                }
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+                cleanup_old_logs(&log_dir, &file_name, retention_days);
             });
         }
 
@@ -436,6 +469,26 @@ impl OwlLoggerBuilder {
 impl Default for OwlLoggerBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn parse_log_level(value: &str) -> Result<LogLevel, OwlError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "trace" => Ok(LogLevel::Trace),
+        "debug" => Ok(LogLevel::Debug),
+        "info" => Ok(LogLevel::Info),
+        "warn" | "warning" => Ok(LogLevel::Warn),
+        "error" => Ok(LogLevel::Error),
+        other => Err(OwlError::Other(format!("invalid OWL_LOG_LEVEL: {other}"))),
+    }
+}
+
+fn parse_output_format(value: &str) -> Result<OutputFormat, OwlError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pretty" => Ok(OutputFormat::Pretty),
+        "compact" => Ok(OutputFormat::Compact),
+        "json" => Ok(OutputFormat::Json),
+        other => Err(OwlError::Other(format!("invalid OWL_LOG_FORMAT: {other}"))),
     }
 }
 
@@ -496,20 +549,28 @@ impl SizeRotatingFileWriter {
                 if max_files > 1 {
                     let n = max_files - 1;
                     // 1. 删除最老的一个压缩备份文件 app.N-1.log.gz 和可能存留的原始 log
-                    let oldest_gz = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, n));
+                    let oldest_gz = self
+                        .log_dir
+                        .join(format!("{}.{}.log.gz", self.file_name, n));
                     let oldest_log = self.log_dir.join(format!("{}.{}.log", self.file_name, n));
                     let _ = std::fs::remove_file(oldest_gz);
                     let _ = std::fs::remove_file(oldest_log);
 
                     // 2. 依次将 app.i.log.gz (及 .log) 顺延重命名为 app.i+1.log.gz (或 .log)
                     for i in (1..n).rev() {
-                        let src_gz = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, i));
-                        let dest_gz = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, i + 1));
+                        let src_gz = self
+                            .log_dir
+                            .join(format!("{}.{}.log.gz", self.file_name, i));
+                        let dest_gz =
+                            self.log_dir
+                                .join(format!("{}.{}.log.gz", self.file_name, i + 1));
                         if src_gz.exists() {
                             std::fs::rename(src_gz, dest_gz)?;
                         }
                         let src_log = self.log_dir.join(format!("{}.{}.log", self.file_name, i));
-                        let dest_log = self.log_dir.join(format!("{}.{}.log", self.file_name, i + 1));
+                        let dest_log =
+                            self.log_dir
+                                .join(format!("{}.{}.log", self.file_name, i + 1));
                         if src_log.exists() {
                             std::fs::rename(src_log, dest_log)?;
                         }
@@ -530,14 +591,20 @@ impl SizeRotatingFileWriter {
                 // 不限制最大文件数量，寻找下一个空闲的压缩文件索引 app.index.log.gz
                 let mut index = 1;
                 let backup_log = loop {
-                    let backup_gz_path = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, index));
-                    let backup_log_path = self.log_dir.join(format!("{}.{}.log", self.file_name, index));
+                    let backup_gz_path = self
+                        .log_dir
+                        .join(format!("{}.{}.log.gz", self.file_name, index));
+                    let backup_log_path = self
+                        .log_dir
+                        .join(format!("{}.{}.log", self.file_name, index));
                     if !backup_gz_path.exists() && !backup_log_path.exists() {
                         break backup_log_path;
                     }
                     index += 1;
                 };
-                let backup_gz = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, index));
+                let backup_gz = self
+                    .log_dir
+                    .join(format!("{}.{}.log.gz", self.file_name, index));
                 std::fs::rename(&file_path, &backup_log)?;
                 compress_file_in_background(backup_log, backup_gz);
             }
@@ -585,17 +652,35 @@ fn compress_file_in_background(src_path: std::path::PathBuf, dest_path: std::pat
     std::thread::spawn(move || {
         let compress_res = (|| -> std::io::Result<()> {
             let src = std::fs::File::open(&src_path)?;
-            let dest = std::fs::File::create(&dest_path)?;
+            let tmp_path = unique_temp_gzip_path(&dest_path);
+            let dest = std::fs::File::create(&tmp_path)?;
             let mut encoder = flate2::write::GzEncoder::new(dest, flate2::Compression::default());
             let mut reader = std::io::BufReader::new(src);
             std::io::copy(&mut reader, &mut encoder)?;
             encoder.finish()?;
+            if dest_path.exists() {
+                let _ = std::fs::remove_file(&dest_path);
+            }
+            std::fs::rename(tmp_path, &dest_path)?;
             Ok(())
         })();
         if compress_res.is_ok() {
             let _ = std::fs::remove_file(src_path);
         }
     });
+}
+
+fn unique_temp_gzip_path(dest_path: &std::path::Path) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let thread_id = format!("{:?}", std::thread::current().id());
+    let file_name = dest_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("owl-log.gz");
+    dest_path.with_file_name(format!("{file_name}.{nanos}.{thread_id}.tmp"))
 }
 
 /// 清理过期日志文件
@@ -626,5 +711,39 @@ fn cleanup_old_logs(log_dir: &std::path::Path, file_name: &str, retention_days: 
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_env_log_level_values() {
+        assert_eq!(parse_log_level("TRACE").unwrap(), LogLevel::Trace);
+        assert_eq!(parse_log_level("warning").unwrap(), LogLevel::Warn);
+        assert!(parse_log_level("verbose").is_err());
+    }
+
+    #[test]
+    fn parses_env_output_format_values() {
+        assert_eq!(parse_output_format("json").unwrap(), OutputFormat::Json);
+        assert_eq!(
+            parse_output_format("COMPACT").unwrap(),
+            OutputFormat::Compact
+        );
+        assert!(parse_output_format("yaml").is_err());
+    }
+
+    #[test]
+    fn temp_gzip_path_stays_next_to_destination() {
+        let dest = std::path::Path::new("/tmp/app.1.log.gz");
+        let tmp = unique_temp_gzip_path(dest);
+
+        assert_eq!(tmp.parent(), dest.parent());
+        assert!(tmp
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("app.1.log.gz.") && name.ends_with(".tmp")));
     }
 }

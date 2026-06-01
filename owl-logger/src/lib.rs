@@ -65,10 +65,10 @@ pub use guard::OwlGuard;
 pub use owl_logger_macros::monitor;
 
 // Re-export tracing 核心宏，方便用户不必额外 `use tracing`
-pub use tracing::{debug, error, info, trace, warn};
-pub use tracing::{debug_span, error_span, info_span, trace_span, warn_span};
 pub use tracing::instrument;
 pub use tracing::Instrument;
+pub use tracing::{debug, error, info, trace, warn};
+pub use tracing::{debug_span, error_span, info_span, trace_span, warn_span};
 
 /// 创建一个新的 Builder 实例
 ///
@@ -82,6 +82,17 @@ pub use tracing::Instrument;
 /// ```
 pub fn builder() -> OwlLoggerBuilder {
     OwlLoggerBuilder::new()
+}
+
+/// 从环境变量创建 Builder 实例
+///
+/// 当前支持：
+/// - `OWL_LOG_LEVEL`: `trace` / `debug` / `info` / `warn` / `error`
+/// - `OWL_LOG_FORMAT`: `pretty` / `compact` / `json`
+/// - `OWL_LOG_DIR`: 日志目录
+/// - `OWL_LOG_FILE`: 日志文件名前缀
+pub fn builder_from_env() -> Result<OwlLoggerBuilder, OwlError> {
+    OwlLoggerBuilder::from_env()
 }
 
 /// 零配置一键初始化
@@ -114,10 +125,17 @@ pub fn try_init() -> Result<OwlGuard, OwlError> {
     builder().try_init()
 }
 
+/// 从环境变量初始化日志系统
+pub fn try_init_from_env() -> Result<OwlGuard, OwlError> {
+    builder_from_env()?.try_init()
+}
+
 /// 动态获取当前的日志过滤器规则
 pub fn get_filter() -> Result<String, OwlError> {
     if let Some(handle) = crate::builder::RELOAD_HANDLE.get() {
-        Ok(handle.with_current(|filter| filter.to_string()).unwrap_or_default())
+        Ok(handle
+            .with_current(|filter| filter.to_string())
+            .unwrap_or_default())
     } else {
         Err(OwlError::NotInitialized)
     }
@@ -129,7 +147,8 @@ pub fn set_filter(filter_str: impl AsRef<str>) -> Result<(), OwlError> {
         let filter_str = filter_str.as_ref();
         let new_filter = tracing_subscriber::EnvFilter::try_new(filter_str)
             .map_err(|e| OwlError::EnvFilter(e.to_string()))?;
-        handle.reload(new_filter)
+        handle
+            .reload(new_filter)
             .map_err(|e| OwlError::Reload(e.to_string()))?;
         Ok(())
     } else {
@@ -145,13 +164,13 @@ pub fn set_level(level: LogLevel) -> Result<(), OwlError> {
 /// 仅供过程宏内部使用的私有 API
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::i18n::I18n;
     pub use crate::config::Language;
-    
+    pub use crate::i18n::I18n;
+
     use std::sync::atomic::{AtomicU8, Ordering};
-    
+
     static CURRENT_LANG: AtomicU8 = AtomicU8::new(0); // 0 = En, 1 = Zh
-    
+
     pub fn set_language(lang: Language) {
         let val = match lang {
             Language::En => 0,
@@ -159,7 +178,7 @@ pub mod __private {
         };
         CURRENT_LANG.store(val, Ordering::SeqCst);
     }
-    
+
     pub fn get_language() -> Language {
         match CURRENT_LANG.load(Ordering::SeqCst) {
             1 => Language::Zh,
@@ -214,4 +233,3 @@ pub mod __private {
         }
     }
 }
-

@@ -7,6 +7,8 @@ pub enum OwlError {
     AlreadyInitialized,
     /// 日志目录创建失败
     LogDirCreation(std::io::Error),
+    /// 日志文件 appender 创建失败
+    FileAppenderCreation(String),
     /// 环境过滤器解析失败
     EnvFilter(String),
     /// 动态修改日志过滤器/级别失败
@@ -26,6 +28,9 @@ impl fmt::Display for OwlError {
             OwlError::LogDirCreation(e) => {
                 write!(f, "owl-logger: failed to create log directory: {e}")
             }
+            OwlError::FileAppenderCreation(msg) => {
+                write!(f, "owl-logger: failed to create file appender: {msg}")
+            }
             OwlError::EnvFilter(e) => {
                 write!(f, "owl-logger: invalid env filter: {e}")
             }
@@ -41,7 +46,6 @@ impl fmt::Display for OwlError {
         }
     }
 }
-
 
 impl std::error::Error for OwlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {

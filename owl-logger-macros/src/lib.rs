@@ -2,7 +2,9 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{parse_macro_input, FnArg, Ident, ItemFn, Meta, MetaList, MetaNameValue, Pat, ReturnType, Token};
+use syn::{
+    parse_macro_input, FnArg, Ident, ItemFn, Meta, MetaList, MetaNameValue, Pat, ReturnType, Token,
+};
 
 /// # `#[monitor]` — 函数监控宏
 ///
@@ -11,7 +13,7 @@ use syn::{parse_macro_input, FnArg, Ident, ItemFn, Meta, MetaList, MetaNameValue
 #[proc_macro_attribute]
 pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
-    
+
     // 使用 syn 解析宏属性参数
     let args = parse_macro_input!(attr as MonitorArgs);
 
@@ -36,6 +38,11 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
         "error" => quote! { tracing::Level::ERROR },
         _ => quote! { tracing::Level::INFO },
     };
+    let slow_check = if let Some(ms) = args.slow_ms {
+        quote! { __owl_elapsed >= std::time::Duration::from_millis(#ms) }
+    } else {
+        quote! { false }
+    };
 
     let has_return = !matches!(return_type, ReturnType::Default);
 
@@ -45,7 +52,7 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
             let __owl_exiting = owl_logger::__private::I18n::exiting_function(__owl_lang);
             let __owl_elapsed_label = owl_logger::__private::I18n::elapsed(__owl_lang);
             let __owl_returned_label = owl_logger::__private::I18n::returned(__owl_lang);
-            
+
             // 使用 autoref 特化在运行期动态判定是否为 Err 并自动升级日志级别
             #[allow(unused_imports)]
             use owl_logger::__private::{OwlLowPriority, OwlHighPriority};
@@ -59,10 +66,23 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
                     "{} {}({}) — {} {:.2?} — ERROR: {}",
                     __owl_exiting,
                     #fn_name_str,
-                    #param_formats,
+                    __owl_params,
                     __owl_elapsed_label,
                     __owl_elapsed,
                     __owl_error_detail
+                );
+            } else if __owl_slow {
+                tracing::event!(
+                    target: "monitor",
+                    tracing::Level::WARN,
+                    "{} {}({}) — {} {:.2?} — SLOW — {} {:?}",
+                    __owl_exiting,
+                    #fn_name_str,
+                    __owl_params,
+                    __owl_elapsed_label,
+                    __owl_elapsed,
+                    __owl_returned_label,
+                    __owl_result
                 );
             } else {
                 tracing::event!(
@@ -71,7 +91,7 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
                     "{} {}({}) — {} {:.2?} — {} {:?}",
                     __owl_exiting,
                     #fn_name_str,
-                    #param_formats,
+                    __owl_params,
                     __owl_elapsed_label,
                     __owl_elapsed,
                     __owl_returned_label,
@@ -84,16 +104,29 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
             let __owl_lang = owl_logger::__private::get_language();
             let __owl_exiting = owl_logger::__private::I18n::exiting_function(__owl_lang);
             let __owl_elapsed_label = owl_logger::__private::I18n::elapsed(__owl_lang);
-            tracing::event!(
-                target: "monitor",
-                #level_token,
-                "{} {}({}) — {} {:.2?}",
-                __owl_exiting,
-                #fn_name_str,
-                #param_formats,
-                __owl_elapsed_label,
-                __owl_elapsed
-            );
+            if __owl_slow {
+                tracing::event!(
+                    target: "monitor",
+                    tracing::Level::WARN,
+                    "{} {}({}) — {} {:.2?} — SLOW",
+                    __owl_exiting,
+                    #fn_name_str,
+                    __owl_params,
+                    __owl_elapsed_label,
+                    __owl_elapsed
+                );
+            } else {
+                tracing::event!(
+                    target: "monitor",
+                    #level_token,
+                    "{} {}({}) — {} {:.2?}",
+                    __owl_exiting,
+                    #fn_name_str,
+                    __owl_params,
+                    __owl_elapsed_label,
+                    __owl_elapsed
+                );
+            }
         }
     };
 
@@ -106,7 +139,7 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
             "{} {}({})",
             __owl_entering,
             #fn_name_str,
-            #param_formats
+            __owl_params
         );
     };
 
@@ -147,10 +180,12 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #(#fn_attrs)*
         #vis #sig {
+            let __owl_params = #param_formats;
             #entering_log
             let __owl_start = std::time::Instant::now();
             #body_call
             let __owl_elapsed = __owl_start.elapsed();
+            let __owl_slow = #slow_check;
             #exit_log
             #return_expr
         }
@@ -163,15 +198,21 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
 struct MonitorArgs {
     level: Option<String>,
     skip: Vec<String>,
+    slow_ms: Option<u64>,
 }
 
 impl Parse for MonitorArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut level = None;
         let mut skip = Vec::new();
+        let mut slow_ms = None;
 
         if input.is_empty() {
-            return Ok(MonitorArgs { level, skip });
+            return Ok(MonitorArgs {
+                level,
+                skip,
+                slow_ms,
+            });
         }
 
         let nested = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
@@ -179,13 +220,36 @@ impl Parse for MonitorArgs {
             match meta {
                 Meta::NameValue(MetaNameValue { path, value, .. }) => {
                     if path.is_ident("level") {
-                        if let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(lit_str), .. }) = value {
+                        if let syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(lit_str),
+                            ..
+                        }) = value
+                        {
                             level = Some(lit_str.value().to_lowercase());
                         } else {
-                            return Err(syn::Error::new_spanned(value, "level must be a string literal, e.g., level = \"debug\""));
+                            return Err(syn::Error::new_spanned(
+                                value,
+                                "level must be a string literal, e.g., level = \"debug\"",
+                            ));
+                        }
+                    } else if path.is_ident("slow_ms") {
+                        if let syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Int(lit_int),
+                            ..
+                        }) = value
+                        {
+                            slow_ms = Some(lit_int.base10_parse()?);
+                        } else {
+                            return Err(syn::Error::new_spanned(
+                                value,
+                                "slow_ms must be an integer literal, e.g., slow_ms = 200",
+                            ));
                         }
                     } else {
-                        return Err(syn::Error::new_spanned(path, "unknown argument, supported: level, skip"));
+                        return Err(syn::Error::new_spanned(
+                            path,
+                            "unknown argument, supported: level, skip, slow_ms",
+                        ));
                     }
                 }
                 Meta::List(MetaList { path, tokens, .. }) => {
@@ -198,7 +262,10 @@ impl Parse for MonitorArgs {
                             skip.push(ident.to_string());
                         }
                     } else {
-                        return Err(syn::Error::new_spanned(path, "unknown argument, supported: level, skip"));
+                        return Err(syn::Error::new_spanned(
+                            path,
+                            "unknown argument, supported: level, skip, slow_ms",
+                        ));
                     }
                 }
                 Meta::Path(path) => {
@@ -207,7 +274,11 @@ impl Parse for MonitorArgs {
             }
         }
 
-        Ok(MonitorArgs { level, skip })
+        Ok(MonitorArgs {
+            level,
+            skip,
+            slow_ms,
+        })
     }
 }
 

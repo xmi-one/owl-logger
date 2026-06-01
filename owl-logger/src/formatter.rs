@@ -1,5 +1,5 @@
-use std::fmt;
 use std::collections::HashMap;
+use std::fmt;
 
 use owo_colors::OwoColorize;
 use tracing::{Event, Level, Subscriber};
@@ -9,6 +9,26 @@ use tracing_subscriber::registry::LookupSpan;
 
 use crate::config::Language;
 use crate::i18n::I18n;
+
+const MASKED: &str = "[MASKED]";
+
+fn is_sensitive_key(sensitive_keys: &[String], field_name: &str) -> bool {
+    sensitive_keys
+        .iter()
+        .any(|key| key.eq_ignore_ascii_case(field_name))
+}
+
+fn mask_string_if_sensitive(
+    sensitive_keys: &[String],
+    field_name: &str,
+    value: impl Into<String>,
+) -> serde_json::Value {
+    if is_sensitive_key(sensitive_keys, field_name) {
+        serde_json::Value::String(MASKED.to_string())
+    } else {
+        serde_json::Value::String(value.into())
+    }
+}
 
 /// owl-logger 自定义格式化器（Pretty / 文本格式）
 pub struct OwlFormatter {
@@ -83,8 +103,8 @@ impl<'a> tracing::field::Visit for PrettyVisitor<'a> {
         if !self.fields.is_empty() {
             self.fields.push(' ');
         }
-        if self.sensitive_keys.contains(&name.to_string()) {
-            self.fields.push_str(&format!("{}=\"[MASKED]\"", name));
+        if is_sensitive_key(self.sensitive_keys, name) {
+            self.fields.push_str(&format!("{}=\"{}\"", name, MASKED));
         } else {
             self.fields.push_str(&format!("{}=\"{}\"", name, value));
         }
@@ -104,8 +124,8 @@ impl<'a> tracing::field::Visit for PrettyVisitor<'a> {
         if !self.fields.is_empty() {
             self.fields.push(' ');
         }
-        if self.sensitive_keys.contains(&name.to_string()) {
-            self.fields.push_str(&format!("{}=\"[MASKED]\"", name));
+        if is_sensitive_key(self.sensitive_keys, name) {
+            self.fields.push_str(&format!("{}=\"{}\"", name, MASKED));
         } else {
             self.fields.push_str(&format!("{}={:?}", name, value));
         }
@@ -150,7 +170,7 @@ where
                         // 脱敏 Span 字段
                         let mut span_fields_map = serde_json::Map::new();
                         parse_span_fields(fields.fields.as_str(), &mut span_fields_map);
-                        
+
                         let mut masked_span_fields = String::new();
                         for (k, v) in span_fields_map {
                             if !masked_span_fields.is_empty() {
@@ -160,13 +180,13 @@ where
                                 serde_json::Value::String(s) => s,
                                 other => other.to_string(),
                             };
-                            if self.sensitive_keys.contains(&k) {
-                                masked_span_fields.push_str(&format!("{}=\"[MASKED]\"", k));
+                            if is_sensitive_key(&self.sensitive_keys, &k) {
+                                masked_span_fields.push_str(&format!("{}=\"{}\"", k, MASKED));
                             } else {
                                 masked_span_fields.push_str(&format!("{}=\"{}\"", k, val_str));
                             }
                         }
-                        
+
                         if !masked_span_fields.is_empty() {
                             write!(writer, "{{{}}}", masked_span_fields)?;
                         }
@@ -229,7 +249,11 @@ where
             if !global_str.is_empty() {
                 global_str.push(' ');
             }
-            global_str.push_str(&format!("{}=\"{}\"", k, v));
+            if is_sensitive_key(&self.sensitive_keys, k) {
+                global_str.push_str(&format!("{}=\"{}\"", k, MASKED));
+            } else {
+                global_str.push_str(&format!("{}=\"{}\"", k, v));
+            }
         }
 
         let full_msg = if global_str.is_empty() {
@@ -279,18 +303,14 @@ struct JsonVisitor<'a> {
 impl<'a> tracing::field::Visit for JsonVisitor<'a> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         let name = field.name();
-        let val = if self.sensitive_keys.contains(&name.to_string()) {
-            serde_json::Value::String("[MASKED]".to_string())
-        } else {
-            serde_json::Value::String(value.to_string())
-        };
+        let val = mask_string_if_sensitive(self.sensitive_keys, name, value);
         self.map.insert(name.to_string(), val);
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
         let name = field.name();
-        let val = if self.sensitive_keys.contains(&name.to_string()) {
-            serde_json::Value::String("[MASKED]".to_string())
+        let val = if is_sensitive_key(self.sensitive_keys, name) {
+            serde_json::Value::String(MASKED.to_string())
         } else {
             serde_json::Value::Number(serde_json::Number::from(value))
         };
@@ -299,8 +319,8 @@ impl<'a> tracing::field::Visit for JsonVisitor<'a> {
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
         let name = field.name();
-        let val = if self.sensitive_keys.contains(&name.to_string()) {
-            serde_json::Value::String("[MASKED]".to_string())
+        let val = if is_sensitive_key(self.sensitive_keys, name) {
+            serde_json::Value::String(MASKED.to_string())
         } else {
             serde_json::Value::Number(serde_json::Number::from(value))
         };
@@ -309,8 +329,8 @@ impl<'a> tracing::field::Visit for JsonVisitor<'a> {
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
         let name = field.name();
-        let val = if self.sensitive_keys.contains(&name.to_string()) {
-            serde_json::Value::String("[MASKED]".to_string())
+        let val = if is_sensitive_key(self.sensitive_keys, name) {
+            serde_json::Value::String(MASKED.to_string())
         } else {
             serde_json::Value::Bool(value)
         };
@@ -319,8 +339,8 @@ impl<'a> tracing::field::Visit for JsonVisitor<'a> {
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
         let name = field.name();
-        let val = if self.sensitive_keys.contains(&name.to_string()) {
-            serde_json::Value::String("[MASKED]".to_string())
+        let val = if is_sensitive_key(self.sensitive_keys, name) {
+            serde_json::Value::String(MASKED.to_string())
         } else if let Some(num) = serde_json::Number::from_f64(value) {
             serde_json::Value::Number(num)
         } else {
@@ -332,14 +352,15 @@ impl<'a> tracing::field::Visit for JsonVisitor<'a> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let name = field.name();
         let val_str = format!("{:?}", value);
-        let val = if self.sensitive_keys.contains(&name.to_string()) {
-            serde_json::Value::String("[MASKED]".to_string())
+        let val = if is_sensitive_key(self.sensitive_keys, name) {
+            serde_json::Value::String(MASKED.to_string())
         } else {
-            let cleaned = if val_str.starts_with('"') && val_str.ends_with('"') && val_str.len() >= 2 {
-                val_str[1..val_str.len() - 1].to_string()
-            } else {
-                val_str
-            };
+            let cleaned =
+                if val_str.starts_with('"') && val_str.ends_with('"') && val_str.len() >= 2 {
+                    val_str[1..val_str.len() - 1].to_string()
+                } else {
+                    val_str
+                };
             serde_json::Value::String(cleaned)
         };
         self.map.insert(name.to_string(), val);
@@ -373,22 +394,34 @@ where
 
         // 3. 来源模块
         if self.show_target {
-            log_obj.insert("target".to_string(), serde_json::Value::String(event.metadata().target().to_string()));
+            log_obj.insert(
+                "target".to_string(),
+                serde_json::Value::String(event.metadata().target().to_string()),
+            );
         }
 
         // 4. 线程信息
         if self.show_thread {
-            let thread_name = std::thread::current().name().unwrap_or("unnamed").to_string();
+            let thread_name = std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_string();
             log_obj.insert("thread".to_string(), serde_json::Value::String(thread_name));
         }
 
         // 5. 源码行号
         if self.show_line_number {
             if let Some(file) = event.metadata().file() {
-                log_obj.insert("file".to_string(), serde_json::Value::String(file.to_string()));
+                log_obj.insert(
+                    "file".to_string(),
+                    serde_json::Value::String(file.to_string()),
+                );
             }
             if let Some(line) = event.metadata().line() {
-                log_obj.insert("line".to_string(), serde_json::Value::Number(serde_json::Number::from(line)));
+                log_obj.insert(
+                    "line".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(line)),
+                );
             }
         }
 
@@ -404,7 +437,10 @@ where
         if let Some(msg_val) = fields_map.remove("message") {
             log_obj.insert("message".to_string(), msg_val);
         } else {
-            log_obj.insert("message".to_string(), serde_json::Value::String("".to_string()));
+            log_obj.insert(
+                "message".to_string(),
+                serde_json::Value::String("".to_string()),
+            );
         }
 
         // 7. Span 链上下文信息合并到顶层（包含 req_id 等）
@@ -416,8 +452,8 @@ where
                         let mut span_fields = serde_json::Map::new();
                         parse_span_fields(fields.fields.as_str(), &mut span_fields);
                         for (k, mut v) in span_fields {
-                            if self.sensitive_keys.contains(&k) {
-                                v = serde_json::Value::String("[MASKED]".to_string());
+                            if is_sensitive_key(&self.sensitive_keys, &k) {
+                                v = serde_json::Value::String(MASKED.to_string());
                             }
                             log_obj.insert(k, v);
                         }
@@ -428,7 +464,10 @@ where
 
         // 8. 全局字段合并到顶层
         for (k, v) in &self.global_fields {
-            log_obj.insert(k.clone(), serde_json::Value::String(v.clone()));
+            log_obj.insert(
+                k.clone(),
+                mask_string_if_sensitive(&self.sensitive_keys, k, v.clone()),
+            );
         }
 
         // 9. 如果还有其他自定义 fields，平铺在顶层
@@ -462,7 +501,7 @@ fn parse_span_fields(s: &str, map: &mut serde_json::Map<String, serde_json::Valu
         }
         if chars.peek() == Some(&'=') {
             chars.next(); // 消费 '='
-            // 读取 Value
+                          // 读取 Value
             let mut val = String::new();
             if chars.peek() == Some(&'"') {
                 chars.next(); // 消费 '"'
@@ -489,7 +528,10 @@ fn parse_span_fields(s: &str, map: &mut serde_json::Map<String, serde_json::Valu
 }
 
 /// 用于文件输出的无色 Pretty 格式化器（禁用 ANSI 转义序列）
-pub(crate) fn file_formatter(language: Language, config: &crate::config::OwlConfig) -> OwlFormatter {
+pub(crate) fn file_formatter(
+    language: Language,
+    config: &crate::config::OwlConfig,
+) -> OwlFormatter {
     OwlFormatter {
         language,
         show_target: config.show_target,
@@ -504,7 +546,10 @@ pub(crate) fn file_formatter(language: Language, config: &crate::config::OwlConf
 }
 
 /// 用于控制台输出的彩色 Pretty 格式化器
-pub(crate) fn console_formatter(language: Language, config: &crate::config::OwlConfig) -> OwlFormatter {
+pub(crate) fn console_formatter(
+    language: Language,
+    config: &crate::config::OwlConfig,
+) -> OwlFormatter {
     OwlFormatter {
         language,
         show_target: config.show_target,
@@ -515,5 +560,56 @@ pub(crate) fn console_formatter(language: Language, config: &crate::config::OwlC
         use_utc: config.use_utc,
         global_fields: config.global_fields.clone(),
         sensitive_keys: config.sensitive_keys.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sensitive_key_matching_is_case_insensitive() {
+        let keys = vec!["token".to_string(), "api_key".to_string()];
+
+        assert!(is_sensitive_key(&keys, "Token"));
+        assert!(is_sensitive_key(&keys, "API_KEY"));
+        assert!(!is_sensitive_key(&keys, "user"));
+    }
+
+    #[test]
+    fn global_field_values_are_masked_when_sensitive() {
+        let keys = vec!["authorization".to_string()];
+
+        assert_eq!(
+            mask_string_if_sensitive(&keys, "Authorization", "Bearer secret"),
+            serde_json::Value::String(MASKED.to_string())
+        );
+        assert_eq!(
+            mask_string_if_sensitive(&keys, "env", "prod"),
+            serde_json::Value::String("prod".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_span_fields_with_commas_and_quotes() {
+        let mut map = serde_json::Map::new();
+
+        parse_span_fields(
+            r#"req_id="req-001", user=alice token="secret value""#,
+            &mut map,
+        );
+
+        assert_eq!(
+            map.get("req_id"),
+            Some(&serde_json::Value::String("req-001".to_string()))
+        );
+        assert_eq!(
+            map.get("user"),
+            Some(&serde_json::Value::String("alice".to_string()))
+        );
+        assert_eq!(
+            map.get("token"),
+            Some(&serde_json::Value::String("secret value".to_string()))
+        );
     }
 }

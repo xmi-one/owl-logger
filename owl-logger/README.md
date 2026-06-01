@@ -25,7 +25,7 @@
 
 ```toml
 [dependencies]
-owl-logger = "0.1.2"
+owl-logger = "0.1.4"
 ```
 
 ## 🚀 快速开始
@@ -81,6 +81,14 @@ owl_logger::set_filter("info,my_crate=trace").unwrap();
 let current_filter = owl_logger::get_filter().unwrap();
 ```
 
+也可以用环境变量生成配置：
+
+```rust
+let _guard = owl_logger::try_init_from_env().unwrap();
+```
+
+支持 `OWL_LOG_LEVEL`、`OWL_LOG_FORMAT`、`OWL_LOG_DIR`、`OWL_LOG_FILE`。
+
 ### 2. 函数监控宏与异常升级
 
 使用 `#[owl_logger::monitor]` 标记函数。宏会在**编译期**解析参数，并结合 **Autoref 特化** 机制在运行期侦测返回值：
@@ -90,7 +98,7 @@ let current_filter = owl_logger::get_filter().unwrap();
 ```rust
 use owl_logger::monitor;
 
-#[monitor]
+#[monitor(slow_ms = 200)]
 fn perform_action(user: &str) -> Result<String, String> {
     if user == "admin" {
         Ok("Welcome".to_string())
@@ -167,6 +175,15 @@ fn main() {
 | `.utc(bool)` | `false` | 是否强制使用 UTC 时区（默认本地时区） |
 | `.max_files(n)` | `None` | 最大历史保留文件数限制（按个数限制） |
 | `.catch_panic(bool)` | `true` | 是否自动接管 Panic 并附带 Backtrace 堆栈输出到日志中 |
+
+环境变量初始化支持：
+
+| 变量 | 可选值 / 说明 |
+|:---|:---|
+| `OWL_LOG_LEVEL` | `trace` / `debug` / `info` / `warn` / `error` |
+| `OWL_LOG_FORMAT` | `pretty` / `compact` / `json` |
+| `OWL_LOG_DIR` | 日志保存目录 |
+| `OWL_LOG_FILE` | 日志文件名前缀 |
 
 ---
 

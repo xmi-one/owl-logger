@@ -161,4 +161,3 @@ impl Default for OwlConfig {
         }
     }
 }
-

@@ -25,7 +25,7 @@
 
 ```toml
 [dependencies]
-owl-logger = "0.1.2"
+owl-logger = "0.1.4"
 ```
 
 ## 🚀 快速开始
