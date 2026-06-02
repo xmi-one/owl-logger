@@ -1,6 +1,6 @@
 [package]
 name = "owl-logger"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.70.0"
 description = "A production-ready, ergonomic logging library for Rust — inspired by Python's xmi_logger, powered by tracing."
@@ -19,11 +19,32 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 owo-colors = "4"
 flate2 = "1.0"
 serde_json = "1.0"
-owl-logger-macros = { path = "../owl-logger-macros", version = "0.1.4" }
+owl-logger-macros = { path = "../owl-logger-macros", version = "0.2.0" }
 
+# OpenTelemetry / OTLP 分布式追踪导出（默认关闭，通过 `otlp` feature 开启）
+opentelemetry = { version = "0.32", optional = true, default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", optional = true, default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = { version = "0.33", optional = true }
 
+[features]
+default = []
+# 启用 OpenTelemetry/OTLP 导出（OTLP/HTTP，使用阻塞式 reqwest，无需 Tokio 运行时）
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 log = "0.4"
+
+[[example]]
+name = "otlp"
+required-features = ["otlp"]
+
+[package.metadata.docs.rs]
+all-features = true

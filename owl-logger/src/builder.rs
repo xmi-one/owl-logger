@@ -188,6 +188,33 @@ impl OwlLoggerBuilder {
         self
     }
 
+    /// 启用按级别分离的独立日志文件。
+    ///
+    /// 开启后会额外写入一个 `{file_name}.{level}.log` 文件，仅记录达到或严重于
+    /// `min_level` 的日志，便于运维快速定位错误。例如：
+    /// - `error_file(LogLevel::Error)` → `app.error.log` 仅含 ERROR
+    /// - `error_file(LogLevel::Warn)`  → `app.warn.log` 含 WARN 与 ERROR
+    pub fn error_file(mut self, min_level: LogLevel) -> Self {
+        self.config.error_file_level = Some(min_level);
+        self
+    }
+
+    /// 设置 OTLP 导出端点（OTLP/HTTP，如 `http://localhost:4318/v1/traces`）。
+    ///
+    /// 需要启用 `otlp` feature 才会真正导出；未启用该 feature 时此设置不生效。
+    pub fn otlp_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.config.otlp_endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// 设置 OTLP 导出时的服务名（`service.name`）。未设置时回退使用文件名前缀。
+    ///
+    /// 需要启用 `otlp` feature 才会真正生效。
+    pub fn otlp_service_name(mut self, name: impl Into<String>) -> Self {
+        self.config.otlp_service_name = Some(name.into());
+        self
+    }
+
     /// 设置异步队列的缓冲行数上限
     pub fn buffered_lines_limit(mut self, limit: usize) -> Self {
         self.config.buffered_lines_limit = limit;
@@ -268,11 +295,11 @@ impl OwlLoggerBuilder {
             None
         };
 
-        // 构建文件输出层
-        let file_layer = if config.enable_file {
-            std::fs::create_dir_all(&config.log_dir).map_err(OwlError::LogDirCreation)?;
+        let mut error_file_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
 
-            // 启动时先清理一次过期日志
+        // 若启用文件输出或分级文件输出，先确保目录存在并清理一次过期日志
+        if config.enable_file || config.error_file_level.is_some() {
+            std::fs::create_dir_all(&config.log_dir).map_err(OwlError::LogDirCreation)?;
             if let Some(retention_days) = config.retention_days {
                 cleanup_old_logs(
                     std::path::Path::new(&config.log_dir),
@@ -280,116 +307,70 @@ impl OwlLoggerBuilder {
                     retention_days,
                 );
             }
+        }
 
-            let file_writer: Box<dyn std::io::Write + Send + Sync + 'static> =
-                match &config.rotation {
-                    RotationPolicy::Daily => {
-                        let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
-                            .rotation(tracing_appender::rolling::Rotation::DAILY)
-                            .filename_prefix(&config.file_name)
-                            .filename_suffix("log");
-                        if let Some(max_files) = config.max_files {
-                            builder = builder.max_log_files(max_files);
-                        }
-                        Box::new(
-                            builder
-                                .build(&config.log_dir)
-                                .map_err(|e| OwlError::FileAppenderCreation(e.to_string()))?,
-                        )
-                    }
-                    RotationPolicy::Hourly => {
-                        let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
-                            .rotation(tracing_appender::rolling::Rotation::HOURLY)
-                            .filename_prefix(&config.file_name)
-                            .filename_suffix("log");
-                        if let Some(max_files) = config.max_files {
-                            builder = builder.max_log_files(max_files);
-                        }
-                        Box::new(
-                            builder
-                                .build(&config.log_dir)
-                                .map_err(|e| OwlError::FileAppenderCreation(e.to_string()))?,
-                        )
-                    }
-                    RotationPolicy::SizeMB(mb) => Box::new(SizeRotatingFileWriter::new(
-                        &config.log_dir,
-                        &config.file_name,
-                        *mb,
-                        config.max_files,
-                        config.retention_days,
-                    )),
-                    RotationPolicy::Never => {
-                        let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
-                            .rotation(tracing_appender::rolling::Rotation::NEVER)
-                            .filename_prefix(&config.file_name)
-                            .filename_suffix("log");
-                        if let Some(max_files) = config.max_files {
-                            builder = builder.max_log_files(max_files);
-                        }
-                        Box::new(
-                            builder
-                                .build(&config.log_dir)
-                                .map_err(|e| OwlError::FileAppenderCreation(e.to_string()))?,
-                        )
-                    }
-                };
-
+        // 构建主文件输出层
+        let file_layer = if config.enable_file {
+            let file_writer = create_file_writer(&config, &config.file_name)?;
             let (non_blocking, guard) =
                 tracing_appender::non_blocking::NonBlockingBuilder::default()
                     .buffered_lines_limit(config.buffered_lines_limit)
                     .lossy(config.lossy)
                     .finish(file_writer);
             file_guard = Some(guard);
-
-            let timer = OwlTime {
-                format: config.time_format.clone(),
-                use_utc: config.use_utc,
-            };
-
-            let layer = match config.format {
-                OutputFormat::Json => {
-                    let json_fmt = formatter::OwlJsonFormatter {
-                        show_target: config.show_target,
-                        show_thread: config.show_thread,
-                        show_line_number: config.show_line_number,
-                        time_format: config.time_format.clone(),
-                        use_utc: config.use_utc,
-                        global_fields: config.global_fields.clone(),
-                        sensitive_keys: config.sensitive_keys.clone(),
-                    };
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(non_blocking)
-                        .event_format(json_fmt)
-                        .boxed()
-                }
-                OutputFormat::Compact => tracing_subscriber::fmt::layer()
-                    .with_writer(non_blocking)
-                    .compact()
-                    .with_timer(timer)
-                    .with_ansi(false)
-                    .boxed(),
-                OutputFormat::Pretty => {
-                    let fmt = formatter::file_formatter(config.language, &config);
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(non_blocking)
-                        .event_format(fmt)
-                        .with_ansi(false)
-                        .boxed()
-                }
-            };
-            Some(layer)
+            Some(build_file_fmt_layer(&config, non_blocking))
         } else {
             None
         };
+
+        // 构建按级别分离的独立文件层（如 error.log）
+        let error_file_layer = if let Some(min_level) = config.error_file_level {
+            let prefix = format!("{}.{}", config.file_name, min_level);
+            let writer = create_file_writer(&config, &prefix)?;
+            let (non_blocking, guard) =
+                tracing_appender::non_blocking::NonBlockingBuilder::default()
+                    .buffered_lines_limit(config.buffered_lines_limit)
+                    .lossy(config.lossy)
+                    .finish(writer);
+            error_file_guard = Some(guard);
+            // 仅放行达到或严重于阈值的日志（LevelFilter 语义：WARN 放行 WARN+ERROR）
+            let level_filter =
+                tracing_subscriber::filter::LevelFilter::from_level(min_level.to_tracing_level());
+            Some(build_file_fmt_layer(&config, non_blocking).with_filter(level_filter))
+        } else {
+            None
+        };
+
+        // 构建 OTLP 导出层（仅在启用 `otlp` feature 且设置了端点时生效）
+        #[cfg(feature = "otlp")]
+        let (otel_layer, _otel_provider): (
+            Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync>>,
+            Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+        ) = match build_otel_provider(&config)? {
+            Some(provider) => {
+                use opentelemetry::trace::TracerProvider as _;
+                let tracer = provider.tracer("owl-logger");
+                let layer: Box<dyn tracing_subscriber::Layer<_> + Send + Sync> =
+                    tracing_opentelemetry::layer().with_tracer(tracer).boxed();
+                (Some(layer), Some(provider))
+            }
+            None => (None, None),
+        };
+        #[cfg(not(feature = "otlp"))]
+        let otel_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync>> = None;
 
         // 包装 reloadable filter 层
         let (env_filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
 
         // 初始化全局注册表
+        // OwlSpanLayer 负责把 span 字段以结构化形式存入 extensions，供格式化器直接读取
         tracing_subscriber::registry()
             .with(env_filter_layer)
+            .with(formatter::OwlSpanLayer)
+            .with(otel_layer)
             .with(console_layer)
             .with(file_layer)
+            .with(error_file_layer)
             .try_init()
             .map_err(|_| OwlError::AlreadyInitialized)?;
         RELOAD_HANDLE
@@ -461,8 +442,133 @@ impl OwlLoggerBuilder {
         Ok(OwlGuard {
             _file_guard: file_guard,
             _console_guard: console_guard,
+            _error_file_guard: error_file_guard,
+            #[cfg(feature = "otlp")]
+            _otel_provider,
             language: config.language,
         })
+    }
+}
+
+/// 根据配置构建 OTLP 追踪 provider（OTLP/HTTP + 阻塞式 reqwest，无需 Tokio 运行时）
+#[cfg(feature = "otlp")]
+fn build_otel_provider(
+    config: &OwlConfig,
+) -> Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>, OwlError> {
+    use opentelemetry_otlp::WithExportConfig;
+
+    let endpoint = match &config.otlp_endpoint {
+        Some(endpoint) => endpoint.clone(),
+        None => return Ok(None),
+    };
+
+    let service_name = config
+        .otlp_service_name
+        .clone()
+        .unwrap_or_else(|| config.file_name.clone());
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint)
+        .build()
+        .map_err(|e| OwlError::Other(format!("OTLP exporter build failed: {e}")))?;
+
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(service_name)
+        .build();
+
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(resource)
+        .build();
+
+    // 注册为全局 provider，便于跨库追踪上下文传播
+    opentelemetry::global::set_tracer_provider(provider.clone());
+
+    Ok(Some(provider))
+}
+
+/// 根据轮转策略为指定文件名前缀创建文件写入器
+fn create_file_writer(
+    config: &OwlConfig,
+    file_name: &str,
+) -> Result<Box<dyn std::io::Write + Send + Sync + 'static>, OwlError> {
+    use tracing_appender::rolling::Rotation;
+
+    let rolling =
+        |rotation: Rotation| -> Result<Box<dyn std::io::Write + Send + Sync + 'static>, OwlError> {
+            let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(rotation)
+                .filename_prefix(file_name)
+                .filename_suffix("log");
+            if let Some(max_files) = config.max_files {
+                builder = builder.max_log_files(max_files);
+            }
+            Ok(Box::new(builder.build(&config.log_dir).map_err(|e| {
+                OwlError::FileAppenderCreation(e.to_string())
+            })?))
+        };
+
+    match &config.rotation {
+        RotationPolicy::Daily => rolling(Rotation::DAILY),
+        RotationPolicy::Hourly => rolling(Rotation::HOURLY),
+        RotationPolicy::Never => rolling(Rotation::NEVER),
+        RotationPolicy::SizeMB(mb) => Ok(Box::new(SizeRotatingFileWriter::new(
+            &config.log_dir,
+            file_name,
+            *mb,
+            config.max_files,
+            config.retention_days,
+        ))),
+    }
+}
+
+/// 根据输出格式为文件写入器构建对应的格式化层（文件输出始终禁用 ANSI）
+///
+/// 对 `S` 泛型化，以便该层可被叠加到注册表栈的任意层级（与内联 `.boxed()` 行为一致）。
+fn build_file_fmt_layer<S>(
+    config: &OwlConfig,
+    non_blocking: tracing_appender::non_blocking::NonBlocking,
+) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    match config.format {
+        OutputFormat::Json => {
+            let json_fmt = formatter::OwlJsonFormatter {
+                show_target: config.show_target,
+                show_thread: config.show_thread,
+                show_line_number: config.show_line_number,
+                time_format: config.time_format.clone(),
+                use_utc: config.use_utc,
+                global_fields: config.global_fields.clone(),
+                sensitive_keys: config.sensitive_keys.clone(),
+            };
+            tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking)
+                .event_format(json_fmt)
+                .boxed()
+        }
+        OutputFormat::Compact => {
+            let timer = OwlTime {
+                format: config.time_format.clone(),
+                use_utc: config.use_utc,
+            };
+            tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking)
+                .compact()
+                .with_timer(timer)
+                .with_ansi(false)
+                .boxed()
+        }
+        OutputFormat::Pretty => {
+            let fmt = formatter::file_formatter(config.language, config);
+            tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking)
+                .event_format(fmt)
+                .with_ansi(false)
+                .boxed()
+        }
     }
 }
 

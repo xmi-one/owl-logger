@@ -126,6 +126,19 @@ pub struct OwlConfig {
     pub buffered_lines_limit: usize,
     /// 队列满时是否允许丢弃日志（false 则阻塞当前线程）
     pub lossy: bool,
+    /// 按级别分离的独立日志文件阈值。
+    ///
+    /// 若设置为 `Some(level)`，则会额外写入一个 `{file_name}.{level}.log` 文件，
+    /// 仅记录达到或严重于该级别的日志（例如 `Error` 仅记录 ERROR，`Warn` 记录 WARN+ERROR）。
+    pub error_file_level: Option<LogLevel>,
+    /// OTLP 导出端点（OTLP/HTTP，如 `http://localhost:4318/v1/traces`）。
+    ///
+    /// 仅在启用 `otlp` feature 时生效；为 `None` 时不导出。
+    pub otlp_endpoint: Option<String>,
+    /// OTLP 导出时上报的服务名（`service.name` 资源属性）。
+    ///
+    /// 为 `None` 时回退使用 `file_name`。仅在启用 `otlp` feature 时生效。
+    pub otlp_service_name: Option<String>,
 }
 
 impl Default for OwlConfig {
@@ -158,6 +171,9 @@ impl Default for OwlConfig {
             retention_days: Some(7),
             buffered_lines_limit: 120_000,
             lossy: true,
+            error_file_level: None,
+            otlp_endpoint: None,
+            otlp_service_name: None,
         }
     }
 }

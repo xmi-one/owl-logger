@@ -167,6 +167,9 @@ pub mod __private {
     pub use crate::config::Language;
     pub use crate::i18n::I18n;
 
+    // Re-export 整个 tracing crate，使 `#[monitor]` 宏展开后无需用户显式依赖 tracing
+    pub use tracing;
+
     use std::sync::atomic::{AtomicU8, Ordering};
 
     static CURRENT_LANG: AtomicU8 = AtomicU8::new(0); // 0 = En, 1 = Zh

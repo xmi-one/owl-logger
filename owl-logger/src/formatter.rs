@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::fmt;
 
 use owo_colors::OwoColorize;
-use tracing::{Event, Level, Subscriber};
+use tracing::span::{Attributes, Record};
+use tracing::{Event, Id, Level, Subscriber};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::config::Language;
@@ -16,6 +18,116 @@ fn is_sensitive_key(sensitive_keys: &[String], field_name: &str) -> bool {
     sensitive_keys
         .iter()
         .any(|key| key.eq_ignore_ascii_case(field_name))
+}
+
+/// 去除 `{:?}` 调试格式化产生的最外层引号（如 `"req-001"` -> `req-001`）
+fn strip_debug_quotes(s: String) -> String {
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s
+    }
+}
+
+/// 结构化存储的 span 字段（保留插入顺序）。
+///
+/// 由 [`OwlSpanLayer`] 在 span 创建/记录时填充，格式化阶段直接读取，
+/// 取代对格式化字符串做脆弱反向解析的旧实现。
+#[derive(Debug, Default)]
+pub(crate) struct OwlSpanFields(pub(crate) Vec<(String, serde_json::Value)>);
+
+/// 把 span 字段收集为结构化 `serde_json::Value` 的访问器
+struct SpanFieldVisitor<'a> {
+    fields: &'a mut Vec<(String, serde_json::Value)>,
+}
+
+impl<'a> SpanFieldVisitor<'a> {
+    fn push(&mut self, name: &str, value: serde_json::Value) {
+        if let Some(slot) = self.fields.iter_mut().find(|(k, _)| k == name) {
+            slot.1 = value;
+        } else {
+            self.fields.push((name.to_string(), value));
+        }
+    }
+}
+
+impl<'a> tracing::field::Visit for SpanFieldVisitor<'a> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.push(field.name(), serde_json::Value::String(value.to_string()));
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.push(
+            field.name(),
+            serde_json::Value::Number(serde_json::Number::from(value)),
+        );
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.push(
+            field.name(),
+            serde_json::Value::Number(serde_json::Number::from(value)),
+        );
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.push(field.name(), serde_json::Value::Bool(value));
+    }
+
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        let val = serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(value.to_string()));
+        self.push(field.name(), val);
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let cleaned = strip_debug_quotes(format!("{:?}", value));
+        self.push(field.name(), serde_json::Value::String(cleaned));
+    }
+}
+
+/// 收集 span 字段并以结构化形式存入 span extensions 的 Layer
+pub(crate) struct OwlSpanLayer;
+
+impl<S> Layer<S> for OwlSpanLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        if let Some(span) = ctx.span(id) {
+            let mut fields = Vec::new();
+            attrs.record(&mut SpanFieldVisitor {
+                fields: &mut fields,
+            });
+            span.extensions_mut().insert(OwlSpanFields(fields));
+        }
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        if let Some(span) = ctx.span(id) {
+            let mut ext = span.extensions_mut();
+            if let Some(existing) = ext.get_mut::<OwlSpanFields>() {
+                values.record(&mut SpanFieldVisitor {
+                    fields: &mut existing.0,
+                });
+            } else {
+                let mut fields = Vec::new();
+                values.record(&mut SpanFieldVisitor {
+                    fields: &mut fields,
+                });
+                ext.insert(OwlSpanFields(fields));
+            }
+        }
+    }
+}
+
+/// 将结构化 span 字段值转换为展示字符串（Pretty 格式用）
+fn span_value_to_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 fn mask_string_if_sensitive(
@@ -44,44 +156,43 @@ pub struct OwlFormatter {
 }
 
 impl OwlFormatter {
-    /// 格式化日志级别（带颜色和语言支持）
-    fn format_level(&self, level: &Level) -> String {
+    /// 直接把级别名（带颜色）写入 writer，避免中间 String 分配。
+    /// I18n::level_name 返回的名称已对齐到 5 字符宽度。
+    fn write_level(&self, w: &mut Writer<'_>, level: &Level) -> fmt::Result {
         let name = I18n::level_name(level, self.language);
-        let padded = format!("{:<5}", name);
-
         if self.enable_ansi {
             match *level {
-                Level::TRACE => padded.purple().to_string(),
-                Level::DEBUG => padded.blue().to_string(),
-                Level::INFO => padded.green().to_string(),
-                Level::WARN => padded.yellow().to_string(),
-                Level::ERROR => padded.red().bold().to_string(),
+                Level::TRACE => write!(w, "{}", name.purple()),
+                Level::DEBUG => write!(w, "{}", name.blue()),
+                Level::INFO => write!(w, "{}", name.green()),
+                Level::WARN => write!(w, "{}", name.yellow()),
+                Level::ERROR => write!(w, "{}", name.red().bold()),
             }
         } else {
-            padded
+            write!(w, "{}", name)
         }
     }
 
-    /// 格式化时间戳
-    fn format_timestamp(&self) -> String {
+    /// 直接把时间戳（带颜色）写入 writer，避免中间 String 分配
+    fn write_timestamp(&self, w: &mut Writer<'_>) -> fmt::Result {
         let ts = if self.use_utc {
-            chrono::Utc::now().format(&self.time_format).to_string()
+            chrono::Utc::now().format(&self.time_format)
         } else {
-            chrono::Local::now().format(&self.time_format).to_string()
+            chrono::Local::now().format(&self.time_format)
         };
         if self.enable_ansi {
-            ts.dimmed().to_string()
+            write!(w, "{}", ts.dimmed())
         } else {
-            ts
+            write!(w, "{}", ts)
         }
     }
 
-    /// 格式化分隔符
-    fn format_separator(&self) -> String {
+    /// 直接把分隔符（带颜色）写入 writer，避免中间 String 分配
+    fn write_separator(&self, w: &mut Writer<'_>) -> fmt::Result {
         if self.enable_ansi {
-            " | ".dimmed().to_string()
+            write!(w, "{}", " | ".dimmed())
         } else {
-            " | ".to_string()
+            write!(w, " | ")
         }
     }
 }
@@ -95,39 +206,38 @@ struct PrettyVisitor<'a> {
 
 impl<'a> tracing::field::Visit for PrettyVisitor<'a> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        use std::fmt::Write as _;
         let name = field.name();
         if name == "message" {
-            *self.message = value.to_string();
+            self.message.clear();
+            self.message.push_str(value);
             return;
         }
         if !self.fields.is_empty() {
             self.fields.push(' ');
         }
         if is_sensitive_key(self.sensitive_keys, name) {
-            self.fields.push_str(&format!("{}=\"{}\"", name, MASKED));
+            let _ = write!(self.fields, "{}=\"{}\"", name, MASKED);
         } else {
-            self.fields.push_str(&format!("{}=\"{}\"", name, value));
+            let _ = write!(self.fields, "{}=\"{}\"", name, value);
         }
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
         let name = field.name();
         if name == "message" {
             let val_str = format!("{:?}", value);
-            if val_str.starts_with('"') && val_str.ends_with('"') && val_str.len() >= 2 {
-                *self.message = val_str[1..val_str.len() - 1].to_string();
-            } else {
-                *self.message = val_str;
-            }
+            *self.message = strip_debug_quotes(val_str);
             return;
         }
         if !self.fields.is_empty() {
             self.fields.push(' ');
         }
         if is_sensitive_key(self.sensitive_keys, name) {
-            self.fields.push_str(&format!("{}=\"{}\"", name, MASKED));
+            let _ = write!(self.fields, "{}=\"{}\"", name, MASKED);
         } else {
-            self.fields.push_str(&format!("{}={:?}", name, value));
+            let _ = write!(self.fields, "{}={:?}", name, value);
         }
     }
 }
@@ -143,12 +253,11 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
-        let sep = self.format_separator();
-        let timestamp = self.format_timestamp();
-        let level = self.format_level(event.metadata().level());
-
-        // 时间 | 级别
-        write!(writer, "{timestamp}{sep}{level}{sep}")?;
+        // 时间 | 级别 |
+        self.write_timestamp(&mut writer)?;
+        self.write_separator(&mut writer)?;
+        self.write_level(&mut writer, event.metadata().level())?;
+        self.write_separator(&mut writer)?;
 
         // Span 上下文信息（如 request req_id="req-001"）
         if let Some(scope) = ctx.event_scope() {
@@ -165,25 +274,21 @@ where
                 }
 
                 let ext = span.extensions();
-                if let Some(fields) = ext.get::<tracing_subscriber::fmt::FormattedFields<N>>() {
-                    if !fields.is_empty() {
-                        // 脱敏 Span 字段
-                        let mut span_fields_map = serde_json::Map::new();
-                        parse_span_fields(fields.fields.as_str(), &mut span_fields_map);
-
+                if let Some(fields) = ext.get::<OwlSpanFields>() {
+                    if !fields.0.is_empty() {
                         let mut masked_span_fields = String::new();
-                        for (k, v) in span_fields_map {
+                        for (k, v) in &fields.0 {
                             if !masked_span_fields.is_empty() {
                                 masked_span_fields.push_str(", ");
                             }
-                            let val_str = match v {
-                                serde_json::Value::String(s) => s,
-                                other => other.to_string(),
-                            };
-                            if is_sensitive_key(&self.sensitive_keys, &k) {
+                            if is_sensitive_key(&self.sensitive_keys, k) {
                                 masked_span_fields.push_str(&format!("{}=\"{}\"", k, MASKED));
                             } else {
-                                masked_span_fields.push_str(&format!("{}=\"{}\"", k, val_str));
+                                masked_span_fields.push_str(&format!(
+                                    "{}=\"{}\"",
+                                    k,
+                                    span_value_to_string(v)
+                                ));
                             }
                         }
 
@@ -195,7 +300,7 @@ where
                 first = false;
             }
             if !first {
-                write!(writer, "{sep}")?;
+                self.write_separator(&mut writer)?;
             }
         }
 
@@ -203,10 +308,11 @@ where
         if self.show_target {
             let target = event.metadata().target();
             if self.enable_ansi {
-                write!(writer, "{}{sep}", target.dimmed())?;
+                write!(writer, "{}", target.dimmed())?;
             } else {
-                write!(writer, "{target}{sep}")?;
+                write!(writer, "{target}")?;
             }
+            self.write_separator(&mut writer)?;
         }
 
         // 线程信息
@@ -214,10 +320,11 @@ where
             let thread = std::thread::current();
             let thread_name = thread.name().unwrap_or("unnamed");
             if self.enable_ansi {
-                write!(writer, "{}{sep}", thread_name.dimmed())?;
+                write!(writer, "{}", thread_name.dimmed())?;
             } else {
-                write!(writer, "{thread_name}{sep}")?;
+                write!(writer, "{thread_name}")?;
             }
+            self.write_separator(&mut writer)?;
         }
 
         // 行号
@@ -225,10 +332,11 @@ where
             if let Some(line) = event.metadata().line() {
                 if let Some(file) = event.metadata().file() {
                     if self.enable_ansi {
-                        write!(writer, "{}{sep}", format!("{file}:{line}").dimmed())?;
+                        write!(writer, "{}", format_args!("{file}:{line}").dimmed())?;
                     } else {
-                        write!(writer, "{file}:{line}{sep}")?;
+                        write!(writer, "{file}:{line}")?;
                     }
+                    self.write_separator(&mut writer)?;
                 }
             }
         }
@@ -270,13 +378,12 @@ where
 
         if self.enable_ansi {
             let level = event.metadata().level();
-            let colored_msg = match *level {
-                Level::ERROR => full_msg.red().bold().to_string(),
-                Level::WARN => full_msg.yellow().to_string(),
-                Level::INFO => full_msg,
-                Level::DEBUG | Level::TRACE => full_msg.dimmed().to_string(),
-            };
-            write!(writer, "{}", colored_msg)?;
+            match *level {
+                Level::ERROR => write!(writer, "{}", full_msg.red().bold())?,
+                Level::WARN => write!(writer, "{}", full_msg.yellow())?,
+                Level::INFO => write!(writer, "{}", full_msg)?,
+                Level::DEBUG | Level::TRACE => write!(writer, "{}", full_msg.dimmed())?,
+            }
         } else {
             write!(writer, "{}", full_msg)?;
         }
@@ -447,16 +554,14 @@ where
         if let Some(scope) = ctx.event_scope() {
             for span in scope.from_root() {
                 let ext = span.extensions();
-                if let Some(fields) = ext.get::<tracing_subscriber::fmt::FormattedFields<N>>() {
-                    if !fields.is_empty() {
-                        let mut span_fields = serde_json::Map::new();
-                        parse_span_fields(fields.fields.as_str(), &mut span_fields);
-                        for (k, mut v) in span_fields {
-                            if is_sensitive_key(&self.sensitive_keys, &k) {
-                                v = serde_json::Value::String(MASKED.to_string());
-                            }
-                            log_obj.insert(k, v);
-                        }
+                if let Some(fields) = ext.get::<OwlSpanFields>() {
+                    for (k, v) in &fields.0 {
+                        let value = if is_sensitive_key(&self.sensitive_keys, k) {
+                            serde_json::Value::String(MASKED.to_string())
+                        } else {
+                            v.clone()
+                        };
+                        log_obj.insert(k.clone(), value);
                     }
                 }
             }
@@ -479,51 +584,6 @@ where
             write!(writer, "{}", serialized)?;
         }
         writeln!(writer)
-    }
-}
-
-/// 解析 Span 格式化字段字符串 (形如 `req_id="req-999" foo=bar`) 到 Map
-fn parse_span_fields(s: &str, map: &mut serde_json::Map<String, serde_json::Value>) {
-    let mut chars = s.chars().peekable();
-    while let Some(&c) = chars.peek() {
-        if c.is_whitespace() || c == ',' {
-            chars.next();
-            continue;
-        }
-        // 读取 Key
-        let mut key = String::new();
-        while let Some(&peek_c) = chars.peek() {
-            if peek_c == '=' || peek_c.is_whitespace() {
-                break;
-            }
-            key.push(peek_c);
-            chars.next();
-        }
-        if chars.peek() == Some(&'=') {
-            chars.next(); // 消费 '='
-                          // 读取 Value
-            let mut val = String::new();
-            if chars.peek() == Some(&'"') {
-                chars.next(); // 消费 '"'
-                for next_c in chars.by_ref() {
-                    if next_c == '"' {
-                        break;
-                    }
-                    val.push(next_c);
-                }
-            } else {
-                while let Some(&peek_c) = chars.peek() {
-                    if peek_c.is_whitespace() || peek_c == ',' {
-                        break;
-                    }
-                    val.push(peek_c);
-                    chars.next();
-                }
-            }
-            map.insert(key, serde_json::Value::String(val));
-        } else {
-            chars.next();
-        }
     }
 }
 
@@ -591,25 +651,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_span_fields_with_commas_and_quotes() {
-        let mut map = serde_json::Map::new();
-
-        parse_span_fields(
-            r#"req_id="req-001", user=alice token="secret value""#,
-            &mut map,
-        );
-
-        assert_eq!(
-            map.get("req_id"),
-            Some(&serde_json::Value::String("req-001".to_string()))
-        );
-        assert_eq!(
-            map.get("user"),
-            Some(&serde_json::Value::String("alice".to_string()))
-        );
-        assert_eq!(
-            map.get("token"),
-            Some(&serde_json::Value::String("secret value".to_string()))
-        );
+    fn strip_debug_quotes_removes_outer_quotes_only() {
+        assert_eq!(strip_debug_quotes("\"req-001\"".to_string()), "req-001");
+        assert_eq!(strip_debug_quotes("42".to_string()), "42");
+        assert_eq!(strip_debug_quotes("\"\"".to_string()), "");
     }
 }

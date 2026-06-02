@@ -14,6 +14,8 @@
 - 🔒 **敏感数据脱敏** — 内置敏感关键字检测（如 `password`, `token`），输出时自动脱敏为 `"[MASKED]"`
 - 🗜️ **后台异步压缩** — 支持大小轮转后，在后台线程自动把旧日志打包压缩为 `.gz` 文件
 - 🧹 **保留期自动清理** — 支持设定日志保留天数，在独立后台线程中自动清理过期的历史日志文件
+- 🚨 **按级别分文件** — 可将达到指定级别（如 `ERROR`）的日志额外单独写入 `{file}.error.log`，便于运维定位
+- 🛰️ **OpenTelemetry/OTLP 导出** — 通过 `otlp` feature 将追踪 span 导出到 Jaeger / Tempo / OTel Collector（OTLP/HTTP，无需 Tokio 运行时）
 - ⏱️ **函数监控宏** — `#[monitor]` 过程宏自动记录入参、返回值和耗时，**若返回 Err 自动升级为 ERROR 级别**并打印错误细节
 - 💥 **崩溃堆栈捕获** — 接管 panic hook，捕获崩溃时能够打印堆栈回溯（`Backtrace`）
 - 🔗 **上下文追踪** — 基于 `tracing::Span` 自动注入 `req_id`，支持同步/异步环境
@@ -25,7 +27,7 @@
 
 ```toml
 [dependencies]
-owl-logger = "0.1.4"
+owl-logger = "0.2.0"
 ```
 
 ## 🚀 快速开始
@@ -110,6 +112,25 @@ fn perform_action(user: &str) -> Result<String, String> {
 // 2. 调用 perform_action("guest") ➔ 输出 ERROR: ← exiting ... — ERROR: "Permission Denied"
 ```
 
+宏支持的参数：
+
+| 参数 | 说明 |
+|:---|:---|
+| `level = "debug"` | 监控日志级别（默认 `info`） |
+| `skip(a, b)` | 将指定参数脱敏为 `[REDACTED]` |
+| `slow_ms = 200` | 超过该毫秒数时以 WARN 级别标记 `SLOW` |
+| `span`（或 `span = true`） | 为函数体建立 `tracing::Span`，使函数**内部**的日志自动带上以函数名命名的上下文 |
+
+> 性能说明：当 `monitor` 目标日志被完全过滤时（例如 `set_filter("monitor=off")`），参数 `Debug` 格式化与进入/退出日志逻辑都会被跳过，实现近似零开销。
+
+```rust
+// span 化：handle 内部的所有日志都会自动归属于 handle 这个 span
+#[monitor(span, slow_ms = 500)]
+fn handle(req_id: u64) {
+    tracing::info!("processing"); // 自动带上 handle 上下文
+}
+```
+
 ### 3. 敏感数据安全脱敏 (PII Masking)
 
 在控制台和 JSON 格式输出中，只要日志字段名命中脱敏关键字列表，其具体数值将被自动脱敏过滤：
@@ -163,6 +184,9 @@ fn main() {
 | `.sensitive_key(key)` | - | 追加单个脱敏词（如密码、Token 字段名） |
 | `.sensitive_keys(keys)` | - | 重新覆盖脱敏词列表 |
 | `.retention_days(days)` | `Some(7)` | 日志过期天数（后台定期清理，默认保留 7 天） |
+| `.error_file(level)` | `None` | 额外写入 `{file}.{level}.log`，仅记录达到或严重于该级别的日志 |
+| `.otlp_endpoint(url)` | `None` | OTLP/HTTP 导出端点（需启用 `otlp` feature） |
+| `.otlp_service_name(name)` | `file_name` | OTLP 上报的 `service.name`（需启用 `otlp` feature） |
 | `.buffered_lines_limit(n)` | `120_000` | 异步非阻塞缓冲队列行数限制 |
 | `.lossy(bool)` | `true` | 队列写满时是否丢弃（`false` 会阻塞当前线程保证防丢失） |
 | `.console(bool)` | `true` | 是否启用控制台（Stderr）输出 |
@@ -184,6 +208,47 @@ fn main() {
 | `OWL_LOG_FORMAT` | `pretty` / `compact` / `json` |
 | `OWL_LOG_DIR` | 日志保存目录 |
 | `OWL_LOG_FILE` | 日志文件名前缀 |
+
+### 5. 按级别分文件（error.log）
+
+将错误日志单独落盘，便于运维快速排障：
+
+```rust
+use owl_logger::LogLevel;
+
+let _guard = owl_logger::builder()
+    .file_name("app")
+    .error_file(LogLevel::Error) // 额外生成 app.error.log，仅含 ERROR
+    .init();
+```
+
+`error_file(LogLevel::Warn)` 则会生成 `app.warn.log`，同时包含 WARN 与 ERROR。该独立文件与主文件共享相同的轮转、压缩与清理策略。
+
+### 6. OpenTelemetry / OTLP 分布式追踪
+
+启用 `otlp` feature 后，可将 `tracing` 的 span 通过 OTLP/HTTP 导出到 Jaeger、Tempo、OpenTelemetry Collector 等后端。采用阻塞式 reqwest 传输，**无需** 应用提供 Tokio 运行时。
+
+```toml
+[dependencies]
+owl-logger = { version = "0.2.0", features = ["otlp"] }
+```
+
+```rust
+let _guard = owl_logger::builder()
+    .otlp_endpoint("http://localhost:4318/v1/traces")
+    .otlp_service_name("my-service")
+    .init();
+
+// 配合 #[monitor(span)] 或 tracing span，调用链将作为 trace 上报
+```
+
+可先用 Jaeger all-in-one 快速体验：
+
+```bash
+docker run --rm -p 4318:4318 -p 16686:16686 jaegertracing/all-in-one
+cargo run --example otlp -p owl-logger --features otlp
+# 打开 http://localhost:16686 查看名为 owl-demo 的服务追踪
+```
 
 ---
 

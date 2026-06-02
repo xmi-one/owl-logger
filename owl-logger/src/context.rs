@@ -59,7 +59,11 @@ pub fn request_span(request_id: &str) -> tracing::Span {
 /// 创建一个自定义名称和字段的 Span（同步）
 ///
 /// 适用于需要追踪除 request_id 以外的自定义上下文信息。
-pub fn with_context(name: &'static str, id_field: &str, id_value: &str) -> tracing::span::EnteredSpan {
+pub fn with_context(
+    name: &'static str,
+    id_field: &str,
+    id_value: &str,
+) -> tracing::span::EnteredSpan {
     let span = tracing::info_span!("context", %name, id_field = %id_field, id_value = %id_value);
     span.entered()
 }
