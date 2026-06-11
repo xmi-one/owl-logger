@@ -14,6 +14,16 @@ use crate::i18n::I18n;
 
 const MASKED: &str = "[MASKED]";
 
+const RESERVED_KEYS: &[&str] = &[
+    "timestamp",
+    "level",
+    "message",
+    "target",
+    "thread",
+    "file",
+    "line",
+];
+
 fn is_sensitive_key(sensitive_keys: &[String], field_name: &str) -> bool {
     sensitive_keys
         .iter()
@@ -561,7 +571,12 @@ where
                         } else {
                             v.clone()
                         };
-                        log_obj.insert(k.clone(), value);
+                        let key = if RESERVED_KEYS.contains(&k.as_str()) {
+                            format!("_{k}")
+                        } else {
+                            k.clone()
+                        };
+                        log_obj.insert(key, value);
                     }
                 }
             }
@@ -569,15 +584,25 @@ where
 
         // 8. 全局字段合并到顶层
         for (k, v) in &self.global_fields {
+            let key = if RESERVED_KEYS.contains(&k.as_str()) {
+                format!("_{k}")
+            } else {
+                k.clone()
+            };
             log_obj.insert(
-                k.clone(),
+                key,
                 mask_string_if_sensitive(&self.sensitive_keys, k, v.clone()),
             );
         }
 
         // 9. 如果还有其他自定义 fields，平铺在顶层
         for (k, v) in fields_map {
-            log_obj.insert(k, v);
+            let key = if RESERVED_KEYS.contains(&k.as_str()) {
+                format!("_{k}")
+            } else {
+                k
+            };
+            log_obj.insert(key, v);
         }
 
         if let Ok(serialized) = serde_json::to_string(&log_obj) {

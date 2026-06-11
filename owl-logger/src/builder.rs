@@ -20,12 +20,11 @@ struct OwlTime {
 
 impl tracing_subscriber::fmt::time::FormatTime for OwlTime {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
-        let ts = if self.use_utc {
-            chrono::Utc::now().format(&self.format).to_string()
+        if self.use_utc {
+            write!(w, "{}", chrono::Utc::now().format(&self.format))
         } else {
-            chrono::Local::now().format(&self.format).to_string()
-        };
-        write!(w, "{}", ts)
+            write!(w, "{}", chrono::Local::now().format(&self.format))
+        }
     }
 }
 
@@ -756,9 +755,9 @@ impl std::io::Write for SizeRotatingFileWriter {
 /// 后台压缩文件逻辑
 fn compress_file_in_background(src_path: std::path::PathBuf, dest_path: std::path::PathBuf) {
     std::thread::spawn(move || {
+        let tmp_path = unique_temp_gzip_path(&dest_path);
         let compress_res = (|| -> std::io::Result<()> {
             let src = std::fs::File::open(&src_path)?;
-            let tmp_path = unique_temp_gzip_path(&dest_path);
             let dest = std::fs::File::create(&tmp_path)?;
             let mut encoder = flate2::write::GzEncoder::new(dest, flate2::Compression::default());
             let mut reader = std::io::BufReader::new(src);
@@ -767,11 +766,13 @@ fn compress_file_in_background(src_path: std::path::PathBuf, dest_path: std::pat
             if dest_path.exists() {
                 let _ = std::fs::remove_file(&dest_path);
             }
-            std::fs::rename(tmp_path, &dest_path)?;
+            std::fs::rename(&tmp_path, &dest_path)?;
             Ok(())
         })();
         if compress_res.is_ok() {
             let _ = std::fs::remove_file(src_path);
+        } else {
+            let _ = std::fs::remove_file(tmp_path);
         }
     });
 }
@@ -789,26 +790,87 @@ fn unique_temp_gzip_path(dest_path: &std::path::Path) -> std::path::PathBuf {
     dest_path.with_file_name(format!("{file_name}.{nanos}.{thread_id}.tmp"))
 }
 
+/// 精确判定文件名是否是由特定前缀的日志组件生成的（包括其轮转产生的备份文件，无递归）
+fn is_log_file_for_prefix_non_recursive(filename: &str, file_name: &str) -> bool {
+    // 1. 完全匹配 {file_name}.log 或 {file_name}.log.gz
+    if filename == format!("{}.log", file_name) || filename == format!("{}.log.gz", file_name) {
+        return true;
+    }
+
+    // 2. 匹配 {file_name}.log.YYYY-MM-DD... (Daily/Hourly 轮转文件)
+    let log_dot = format!("{}.log.", file_name);
+    if filename.starts_with(&log_dot) {
+        return true;
+    }
+
+    // 3. 匹配 {file_name}.{index}.log / .log.gz (Size 轮转文件)
+    // 格式必须为 {file_name}.<数字索引>.log 或 {file_name}.<数字索引>.log.gz
+    let dot_prefix = format!("{}.", file_name);
+    if filename.starts_with(&dot_prefix) {
+        let remaining = &filename[dot_prefix.len()..];
+        if let Some(first_dot) = remaining.find('.') {
+            let part = &remaining[..first_dot];
+            if part.chars().all(|c| c.is_ascii_digit()) {
+                let suffix = &remaining[first_dot..];
+                if suffix == ".log" || suffix == ".log.gz" {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn is_log_file_for_prefix(filename: &str, file_name: &str) -> bool {
+    if is_log_file_for_prefix_non_recursive(filename, file_name) {
+        return true;
+    }
+
+    // 检查各日志级别的独立文件分支（如 app.error.log 等）
+    for level in &["error", "warn", "info", "debug", "trace"] {
+        let level_prefix = format!("{}.{}", file_name, level);
+        if is_log_file_for_prefix_non_recursive(filename, &level_prefix) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// 清理过期日志文件
 fn cleanup_old_logs(log_dir: &std::path::Path, file_name: &str, retention_days: usize) {
     let now = std::time::SystemTime::now();
     let max_age = std::time::Duration::from_secs(retention_days as u64 * 24 * 60 * 60);
+
+    // 当前活跃写入的文件，绝对不被清理
+    let log_exact = format!("{}.log", file_name);
+    let active_error_log_prefixes = [
+        format!("{}.error.log", file_name),
+        format!("{}.warn.log", file_name),
+        format!("{}.info.log", file_name),
+        format!("{}.debug.log", file_name),
+        format!("{}.trace.log", file_name),
+    ];
 
     if let Ok(entries) = std::fs::read_dir(log_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
                 if let Some(filename_str) = path.file_name().and_then(|s| s.to_str()) {
-                    let is_exact_or_dotted = filename_str == format!("{}.log", file_name)
-                        || filename_str == format!("{}.log.gz", file_name)
-                        || filename_str.starts_with(&format!("{}.", file_name));
-
-                    if is_exact_or_dotted {
-                        if let Ok(metadata) = entry.metadata() {
-                            if let Ok(modified) = metadata.modified() {
-                                if let Ok(age) = now.duration_since(modified) {
-                                    if age > max_age {
-                                        let _ = std::fs::remove_file(path);
+                    // 1. 判断是否属于此日志文件的模式
+                    if is_log_file_for_prefix(filename_str, file_name) {
+                        // 2. 排除正在活跃写入的文件
+                        let is_active = filename_str == log_exact 
+                            || active_error_log_prefixes.iter().any(|p| filename_str == p);
+                        
+                        if !is_active {
+                            if let Ok(metadata) = entry.metadata() {
+                                if let Ok(modified) = metadata.modified() {
+                                    if let Ok(age) = now.duration_since(modified) {
+                                        if age > max_age {
+                                            let _ = std::fs::remove_file(path);
+                                        }
                                     }
                                 }
                             }

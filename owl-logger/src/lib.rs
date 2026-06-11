@@ -179,11 +179,11 @@ pub mod __private {
             Language::En => 0,
             Language::Zh => 1,
         };
-        CURRENT_LANG.store(val, Ordering::SeqCst);
+        CURRENT_LANG.store(val, Ordering::Relaxed);
     }
 
     pub fn get_language() -> Language {
-        match CURRENT_LANG.load(Ordering::SeqCst) {
+        match CURRENT_LANG.load(Ordering::Relaxed) {
             1 => Language::Zh,
             _ => Language::En,
         }

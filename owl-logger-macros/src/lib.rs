@@ -205,14 +205,26 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    let mut should_log_conditions = vec![
+        quote! { owl_logger::__private::tracing::enabled!(target: "monitor", #level_token) }
+    ];
+    if args.slow_ms.is_some() {
+        should_log_conditions.push(quote! {
+            owl_logger::__private::tracing::enabled!(target: "monitor", owl_logger::__private::tracing::Level::WARN)
+        });
+    }
+    if has_return {
+        should_log_conditions.push(quote! {
+            owl_logger::__private::tracing::enabled!(target: "monitor", owl_logger::__private::tracing::Level::ERROR)
+        });
+    }
+    let should_log_expr = quote! { #(#should_log_conditions)||* };
+
     let expanded = quote! {
         #(#fn_attrs)*
         #vis #sig {
-            // 仅当 monitor 目标在任一可能输出的级别启用时才捕获参数，否则近似零开销
-            let __owl_should_log =
-                owl_logger::__private::tracing::enabled!(target: "monitor", #level_token)
-                || owl_logger::__private::tracing::enabled!(target: "monitor", owl_logger::__private::tracing::Level::WARN)
-                || owl_logger::__private::tracing::enabled!(target: "monitor", owl_logger::__private::tracing::Level::ERROR);
+            // 仅当 monitor 目标在可能输出的日志级别启用时才捕获参数，否则实现近似零开销
+            let __owl_should_log = #should_log_expr;
 
             let __owl_params: String = if __owl_should_log { #param_formats } else { String::new() };
 
