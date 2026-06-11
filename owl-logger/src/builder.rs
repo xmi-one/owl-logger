@@ -6,6 +6,7 @@ use crate::error::OwlError;
 use crate::formatter;
 use crate::guard::OwlGuard;
 use crate::i18n::I18n;
+use chrono::Timelike;
 
 /// 全局日志过滤器重载句柄，用于在运行期修改日志过滤器级别
 pub(crate) static RELOAD_HANDLE: std::sync::OnceLock<
@@ -492,34 +493,13 @@ fn create_file_writer(
     config: &OwlConfig,
     file_name: &str,
 ) -> Result<Box<dyn std::io::Write + Send + Sync + 'static>, OwlError> {
-    use tracing_appender::rolling::Rotation;
-
-    let rolling =
-        |rotation: Rotation| -> Result<Box<dyn std::io::Write + Send + Sync + 'static>, OwlError> {
-            let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
-                .rotation(rotation)
-                .filename_prefix(file_name)
-                .filename_suffix("log");
-            if let Some(max_files) = config.max_files {
-                builder = builder.max_log_files(max_files);
-            }
-            Ok(Box::new(builder.build(&config.log_dir).map_err(|e| {
-                OwlError::FileAppenderCreation(e.to_string())
-            })?))
-        };
-
-    match &config.rotation {
-        RotationPolicy::Daily => rolling(Rotation::DAILY),
-        RotationPolicy::Hourly => rolling(Rotation::HOURLY),
-        RotationPolicy::Never => rolling(Rotation::NEVER),
-        RotationPolicy::SizeMB(mb) => Ok(Box::new(SizeRotatingFileWriter::new(
-            &config.log_dir,
-            file_name,
-            *mb,
-            config.max_files,
-            config.retention_days,
-        ))),
-    }
+    Ok(Box::new(OwlRollingFileWriter::new(
+        &config.log_dir,
+        file_name,
+        config.rotation.clone(),
+        config.max_files,
+        config.retention_days,
+    )))
 }
 
 /// 根据输出格式为文件写入器构建对应的格式化层（文件输出始终禁用 ANSI）
@@ -597,33 +577,43 @@ fn parse_output_format(value: &str) -> Result<OutputFormat, OwlError> {
     }
 }
 
-/// 支持按文件大小限制自动轮转，且在后台线程进行 Gzip 压缩与保留清理的自定义文件写入器
-struct SizeRotatingFileWriter {
+/// 支持按时间（每天、每小时）或大小限制自动轮转，且活跃日志文件名不含时间戳的自定义文件写入器
+struct OwlRollingFileWriter {
     log_dir: std::path::PathBuf,
     file_name: String,
+    rotation: RotationPolicy,
     max_size: u64,
     max_files: Option<usize>,
     retention_days: Option<usize>,
     current_file: Option<std::fs::File>,
     current_size: u64,
+    active_date: Option<chrono::NaiveDate>,
+    active_hour: Option<(chrono::NaiveDate, u32)>,
 }
 
-impl SizeRotatingFileWriter {
+impl OwlRollingFileWriter {
     pub fn new(
         log_dir: impl Into<std::path::PathBuf>,
         file_name: impl Into<String>,
-        max_size_mb: u64,
+        rotation: RotationPolicy,
         max_files: Option<usize>,
         retention_days: Option<usize>,
     ) -> Self {
+        let max_size = match &rotation {
+            RotationPolicy::SizeMB(mb) => mb * 1024 * 1024,
+            _ => 0,
+        };
         Self {
             log_dir: log_dir.into(),
             file_name: file_name.into(),
-            max_size: max_size_mb * 1024 * 1024,
+            rotation,
+            max_size,
             max_files,
             retention_days,
             current_file: None,
             current_size: 0,
+            active_date: None,
+            active_hour: None,
         }
     }
 
@@ -633,6 +623,47 @@ impl SizeRotatingFileWriter {
         }
 
         let file_path = self.log_dir.join(format!("{}.log", self.file_name));
+        
+        // 检查启动时是否需要轮转已经存在的老日志文件
+        if file_path.exists() {
+            let now = chrono::Local::now();
+            let mut rotate_needed = false;
+            let mut rotation_date = None;
+            let mut rotation_hour = None;
+
+            if let Ok(metadata) = file_path.metadata() {
+                if let Ok(modified) = metadata.modified() {
+                    let modified_local: chrono::DateTime<chrono::Local> = modified.into();
+                    match &self.rotation {
+                        RotationPolicy::Daily => {
+                            if modified_local.date_naive() != now.date_naive() {
+                                rotate_needed = true;
+                                rotation_date = Some(modified_local.date_naive());
+                            }
+                        }
+                        RotationPolicy::Hourly => {
+                            let mod_hour = (modified_local.date_naive(), modified_local.hour());
+                            let now_hour = (now.date_naive(), now.hour());
+                            if mod_hour != now_hour {
+                                rotate_needed = true;
+                                rotation_hour = Some(mod_hour);
+                            }
+                        }
+                        RotationPolicy::SizeMB(_) => {
+                            if metadata.len() >= self.max_size {
+                                rotate_needed = true;
+                            }
+                        }
+                        RotationPolicy::Never => {}
+                    }
+                }
+            }
+
+            if rotate_needed {
+                self.rotate_existing(&file_path, rotation_date, rotation_hour)?;
+            }
+        }
+
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -640,82 +671,117 @@ impl SizeRotatingFileWriter {
 
         let metadata = file.metadata()?;
         self.current_size = metadata.len();
+        
+        let now = chrono::Local::now();
+        self.active_date = Some(now.date_naive());
+        self.active_hour = Some((now.date_naive(), now.hour()));
         self.current_file = Some(file);
 
         Ok(self.current_file.as_mut().unwrap())
     }
 
-    fn rotate(&mut self) -> std::io::Result<()> {
-        self.current_file = None;
-
-        let file_path = self.log_dir.join(format!("{}.log", self.file_name));
-        if file_path.exists() {
-            if let Some(max_files) = self.max_files {
-                if max_files > 1 {
-                    let n = max_files - 1;
-                    // 1. 删除最老的一个压缩备份文件 app.N-1.log.gz 和可能存留的原始 log
-                    let oldest_gz = self
-                        .log_dir
-                        .join(format!("{}.{}.log.gz", self.file_name, n));
-                    let oldest_log = self.log_dir.join(format!("{}.{}.log", self.file_name, n));
-                    let _ = std::fs::remove_file(oldest_gz);
-                    let _ = std::fs::remove_file(oldest_log);
-
-                    // 2. 依次将 app.i.log.gz (及 .log) 顺延重命名为 app.i+1.log.gz (或 .log)
-                    for i in (1..n).rev() {
-                        let src_gz = self
-                            .log_dir
-                            .join(format!("{}.{}.log.gz", self.file_name, i));
-                        let dest_gz =
-                            self.log_dir
-                                .join(format!("{}.{}.log.gz", self.file_name, i + 1));
-                        if src_gz.exists() {
-                            std::fs::rename(src_gz, dest_gz)?;
-                        }
-                        let src_log = self.log_dir.join(format!("{}.{}.log", self.file_name, i));
-                        let dest_log =
-                            self.log_dir
-                                .join(format!("{}.{}.log", self.file_name, i + 1));
-                        if src_log.exists() {
-                            std::fs::rename(src_log, dest_log)?;
-                        }
+    fn rotate_existing(
+        &mut self,
+        file_path: &std::path::Path,
+        rotation_date: Option<chrono::NaiveDate>,
+        rotation_hour: Option<(chrono::NaiveDate, u32)>,
+    ) -> std::io::Result<()> {
+        match &self.rotation {
+            RotationPolicy::Daily | RotationPolicy::Hourly => {
+                let date_str = match &self.rotation {
+                    RotationPolicy::Daily => {
+                        let d = rotation_date.unwrap_or_else(|| chrono::Local::now().date_naive());
+                        d.format("%Y-%m-%d").to_string()
                     }
-
-                    // 3. 将当前的 app.log 重命名为 app.1.log
-                    let dest = self.log_dir.join(format!("{}.1.log", self.file_name));
-                    std::fs::rename(&file_path, &dest)?;
-
-                    // 4. 后台压缩 app.1.log -> app.1.log.gz
-                    let dest_gz = self.log_dir.join(format!("{}.1.log.gz", self.file_name));
-                    compress_file_in_background(dest, dest_gz);
-                } else {
-                    // max_files == 1: 直接删除当前日志文件，不保存任何备份
-                    let _ = std::fs::remove_file(&file_path);
-                }
-            } else {
-                // 不限制最大文件数量，寻找下一个空闲的压缩文件索引 app.index.log.gz
-                let mut index = 1;
-                let backup_log = loop {
-                    let backup_gz_path = self
-                        .log_dir
-                        .join(format!("{}.{}.log.gz", self.file_name, index));
-                    let backup_log_path = self
-                        .log_dir
-                        .join(format!("{}.{}.log", self.file_name, index));
-                    if !backup_gz_path.exists() && !backup_log_path.exists() {
-                        break backup_log_path;
+                    RotationPolicy::Hourly => {
+                        let (d, h) = rotation_hour.unwrap_or_else(|| {
+                            let now = chrono::Local::now();
+                            (now.date_naive(), now.hour())
+                        });
+                        format!("{}-{:02}", d.format("%Y-%m-%d"), h)
                     }
-                    index += 1;
+                    _ => unreachable!(),
                 };
-                let backup_gz = self
-                    .log_dir
-                    .join(format!("{}.{}.log.gz", self.file_name, index));
-                std::fs::rename(&file_path, &backup_log)?;
-                compress_file_in_background(backup_log, backup_gz);
+
+                let mut dest_path = self.log_dir.join(format!("{}.{}.log", self.file_name, date_str));
+                if dest_path.exists() {
+                    let mut index = 1;
+                    loop {
+                        let test_path = self.log_dir.join(format!("{}.{}.{}.log", self.file_name, date_str, index));
+                        if !test_path.exists() {
+                            dest_path = test_path;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                std::fs::rename(file_path, dest_path)?;
             }
+            RotationPolicy::SizeMB(_) => {
+                self.rotate_size(file_path)?;
+            }
+            RotationPolicy::Never => {}
+        }
+        Ok(())
+    }
+
+    fn rotate_size(&mut self, file_path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(max_files) = self.max_files {
+            if max_files > 1 {
+                let n = max_files - 1;
+                let oldest_gz = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, n));
+                let oldest_log = self.log_dir.join(format!("{}.{}.log", self.file_name, n));
+                let _ = std::fs::remove_file(oldest_gz);
+                let _ = std::fs::remove_file(oldest_log);
+
+                for i in (1..n).rev() {
+                    let src_gz = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, i));
+                    let dest_gz = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, i + 1));
+                    if src_gz.exists() {
+                        std::fs::rename(src_gz, dest_gz)?;
+                    }
+                    let src_log = self.log_dir.join(format!("{}.{}.log", self.file_name, i));
+                    let dest_log = self.log_dir.join(format!("{}.{}.log", self.file_name, i + 1));
+                    if src_log.exists() {
+                        std::fs::rename(src_log, dest_log)?;
+                    }
+                }
+
+                let dest = self.log_dir.join(format!("{}.1.log", self.file_name));
+                std::fs::rename(file_path, &dest)?;
+
+                let dest_gz = self.log_dir.join(format!("{}.1.log.gz", self.file_name));
+                compress_file_in_background(dest, dest_gz);
+            } else {
+                let _ = std::fs::remove_file(file_path);
+            }
+        } else {
+            let mut index = 1;
+            let backup_log = loop {
+                let backup_gz_path = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, index));
+                let backup_log_path = self.log_dir.join(format!("{}.{}.log", self.file_name, index));
+                if !backup_gz_path.exists() && !backup_log_path.exists() {
+                    break backup_log_path;
+                }
+                index += 1;
+            };
+            let backup_gz = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, index));
+            std::fs::rename(file_path, &backup_log)?;
+            compress_file_in_background(backup_log, backup_gz);
+        }
+        Ok(())
+    }
+
+    fn rotate(&mut self, now: chrono::DateTime<chrono::Local>) -> std::io::Result<()> {
+        self.current_file = None;
+        let file_path = self.log_dir.join(format!("{}.log", self.file_name));
+        
+        if file_path.exists() {
+            let rotation_date = self.active_date;
+            let rotation_hour = self.active_hour;
+            self.rotate_existing(&file_path, rotation_date, rotation_hour)?;
         }
 
-        // 重新清理过期日志
         if let Some(retention_days) = self.retention_days {
             cleanup_old_logs(&self.log_dir, &self.file_name, retention_days);
         }
@@ -727,17 +793,47 @@ impl SizeRotatingFileWriter {
             .open(&file_path)?;
 
         self.current_size = 0;
+        self.active_date = Some(now.date_naive());
+        self.active_hour = Some((now.date_naive(), now.hour()));
         self.current_file = Some(file);
+
         Ok(())
     }
 }
 
-impl std::io::Write for SizeRotatingFileWriter {
+impl std::io::Write for OwlRollingFileWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let now = chrono::Local::now();
         self.init_file()?;
-        if self.current_size + buf.len() as u64 > self.max_size {
-            self.rotate()?;
+
+        let mut rotate_needed = false;
+        match &self.rotation {
+            RotationPolicy::Daily => {
+                if let Some(active_date) = self.active_date {
+                    if now.date_naive() != active_date {
+                        rotate_needed = true;
+                    }
+                }
+            }
+            RotationPolicy::Hourly => {
+                if let Some((active_date, active_hour)) = self.active_hour {
+                    if now.date_naive() != active_date || now.hour() != active_hour {
+                        rotate_needed = true;
+                    }
+                }
+            }
+            RotationPolicy::SizeMB(_) => {
+                if self.current_size + buf.len() as u64 > self.max_size {
+                    rotate_needed = true;
+                }
+            }
+            RotationPolicy::Never => {}
         }
+
+        if rotate_needed {
+            self.rotate(now)?;
+        }
+
         let file = self.current_file.as_mut().unwrap();
         let written = file.write(buf)?;
         self.current_size += written as u64;
@@ -790,6 +886,51 @@ fn unique_temp_gzip_path(dest_path: &std::path::Path) -> std::path::PathBuf {
     dest_path.with_file_name(format!("{file_name}.{nanos}.{thread_id}.tmp"))
 }
 
+fn is_daily_date_str(s: &str) -> bool {
+    if s.len() != 10 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    bytes[0..4].iter().all(|c| c.is_ascii_digit())
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(|c| c.is_ascii_digit())
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(|c| c.is_ascii_digit())
+}
+
+fn is_hourly_date_str(s: &str) -> bool {
+    if s.len() != 13 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    bytes[0..4].iter().all(|c| c.is_ascii_digit())
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(|c| c.is_ascii_digit())
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(|c| c.is_ascii_digit())
+        && bytes[10] == b'-'
+        && bytes[11..13].iter().all(|c| c.is_ascii_digit())
+}
+
+fn matches_suffix(mut s: &str) -> bool {
+    if s == ".log" || s == ".log.gz" {
+        return true;
+    }
+    if s.starts_with('.') {
+        s = &s[1..];
+        if let Some(next_dot) = s.find('.') {
+            let index_part = &s[..next_dot];
+            if index_part.chars().all(|c| c.is_ascii_digit()) && !index_part.is_empty() {
+                let rest = &s[next_dot..];
+                if rest == ".log" || rest == ".log.gz" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// 精确判定文件名是否是由特定前缀的日志组件生成的（包括其轮转产生的备份文件，无递归）
 fn is_log_file_for_prefix_non_recursive(filename: &str, file_name: &str) -> bool {
     // 1. 完全匹配 {file_name}.log 或 {file_name}.log.gz
@@ -797,22 +938,33 @@ fn is_log_file_for_prefix_non_recursive(filename: &str, file_name: &str) -> bool
         return true;
     }
 
-    // 2. 匹配 {file_name}.log.YYYY-MM-DD... (Daily/Hourly 轮转文件)
+    // 2. 匹配旧格式 {file_name}.log.YYYY-MM-DD... (Daily/Hourly 轮转文件)
     let log_dot = format!("{}.log.", file_name);
     if filename.starts_with(&log_dot) {
         return true;
     }
 
-    // 3. 匹配 {file_name}.{index}.log / .log.gz (Size 轮转文件)
-    // 格式必须为 {file_name}.<数字索引>.log 或 {file_name}.<数字索引>.log.gz
+    // 3. 匹配新格式 {file_name}.YYYY-MM-DD.log / .log.gz
+    // 或者是 {file_name}.YYYY-MM-DD-HH.log / .log.gz
+    // 或者是 {file_name}.index.log / .log.gz (Size 轮转文件)
+    // 或者是带有重复序号的 {file_name}.YYYY-MM-DD.index.log / .log.gz
     let dot_prefix = format!("{}.", file_name);
     if filename.starts_with(&dot_prefix) {
         let remaining = &filename[dot_prefix.len()..];
         if let Some(first_dot) = remaining.find('.') {
             let part = &remaining[..first_dot];
-            if part.chars().all(|c| c.is_ascii_digit()) {
-                let suffix = &remaining[first_dot..];
-                if suffix == ".log" || suffix == ".log.gz" {
+            let suffix = &remaining[first_dot..];
+            if matches_suffix(suffix) {
+                // A. 如果 part 是纯数字 (Size 轮转索引)
+                if part.chars().all(|c| c.is_ascii_digit()) && !part.is_empty() {
+                    return true;
+                }
+                // B. 如果 part 是 YYYY-MM-DD 日期
+                if is_daily_date_str(part) {
+                    return true;
+                }
+                // C. 如果 part 是 YYYY-MM-DD-HH 级别的日期
+                if is_hourly_date_str(part) {
                     return true;
                 }
             }
@@ -913,5 +1065,94 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("app.1.log.gz.") && name.ends_with(".tmp")));
+    }
+
+    #[test]
+    fn test_owl_rolling_file_writer_daily_rotation() {
+        let temp_dir = std::env::temp_dir().join(format!("owl-test-daily-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let file_name = "test_daily";
+        let mut writer = OwlRollingFileWriter::new(
+            &temp_dir,
+            file_name,
+            RotationPolicy::Daily,
+            None,
+            None,
+        );
+
+        // First write: creates test_daily.log
+        std::io::Write::write_all(&mut writer, b"hello day 1\n").unwrap();
+        std::io::Write::flush(&mut writer).unwrap();
+
+        let active_path = temp_dir.join("test_daily.log");
+        assert!(active_path.exists());
+
+        // Simulate that the active date was yesterday
+        let yesterday = chrono::Local::now().date_naive() - chrono::Days::new(1);
+        writer.active_date = Some(yesterday);
+
+        // Next write triggers daily rotation
+        std::io::Write::write_all(&mut writer, b"hello day 2\n").unwrap();
+        std::io::Write::flush(&mut writer).unwrap();
+
+        // The old file should be rotated to test_daily.YYYY-MM-DD.log (using the yesterday's date)
+        let expected_rotated_name = format!("{}.{}.log", file_name, yesterday.format("%Y-%m-%d"));
+        let rotated_path = temp_dir.join(&expected_rotated_name);
+        assert!(rotated_path.exists(), "Expected rotated file to exist: {:?}", rotated_path);
+
+        // The active file should still exist and contain the new logs
+        assert!(active_path.exists());
+        let active_content = std::fs::read_to_string(&active_path).unwrap();
+        assert_eq!(active_content, "hello day 2\n");
+
+        let rotated_content = std::fs::read_to_string(&rotated_path).unwrap();
+        assert_eq!(rotated_content, "hello day 1\n");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_owl_rolling_file_writer_hourly_rotation() {
+        let temp_dir = std::env::temp_dir().join(format!("owl-test-hourly-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let file_name = "test_hourly";
+        let mut writer = OwlRollingFileWriter::new(
+            &temp_dir,
+            file_name,
+            RotationPolicy::Hourly,
+            None,
+            None,
+        );
+
+        std::io::Write::write_all(&mut writer, b"hello hour 1\n").unwrap();
+        std::io::Write::flush(&mut writer).unwrap();
+
+        let active_path = temp_dir.join("test_hourly.log");
+        assert!(active_path.exists());
+
+        // Simulate that the active hour was 2 hours ago
+        let now = chrono::Local::now();
+        let two_hours_ago = now - chrono::Duration::hours(2);
+        let active_hour_val = (two_hours_ago.date_naive(), two_hours_ago.hour());
+        writer.active_hour = Some(active_hour_val);
+
+        // Next write triggers hourly rotation
+        std::io::Write::write_all(&mut writer, b"hello hour 2\n").unwrap();
+        std::io::Write::flush(&mut writer).unwrap();
+
+        let expected_rotated_name = format!("{}.{}-{:02}.log", file_name, active_hour_val.0.format("%Y-%m-%d"), active_hour_val.1);
+        let rotated_path = temp_dir.join(&expected_rotated_name);
+        assert!(rotated_path.exists(), "Expected rotated file to exist: {:?}", rotated_path);
+
+        assert!(active_path.exists());
+        let active_content = std::fs::read_to_string(&active_path).unwrap();
+        assert_eq!(active_content, "hello hour 2\n");
+
+        let rotated_content = std::fs::read_to_string(&rotated_path).unwrap();
+        assert_eq!(rotated_content, "hello hour 1\n");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

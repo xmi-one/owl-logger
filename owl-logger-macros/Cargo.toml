@@ -1,6 +1,6 @@
 [package]
 name = "owl-logger-macros"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.70.0"
 description = "Procedural macros for owl-logger — #[monitor] attribute macro for automatic function instrumentation."
