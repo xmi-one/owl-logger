@@ -27,7 +27,7 @@
 
 ```toml
 [dependencies]
-owl-logger = "0.2.2"
+owl-logger = "0.2.3"
 ```
 
 ## 🚀 快速开始
@@ -230,7 +230,7 @@ let _guard = owl_logger::builder()
 
 ```toml
 [dependencies]
-owl-logger = { version = "0.2.2", features = ["otlp"] }
+owl-logger = { version = "0.2.3", features = ["otlp"] }
 ```
 
 ```rust

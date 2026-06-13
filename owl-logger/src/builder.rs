@@ -687,38 +687,47 @@ impl OwlRollingFileWriter {
         rotation_hour: Option<(chrono::NaiveDate, u32)>,
     ) -> std::io::Result<()> {
         match &self.rotation {
-            RotationPolicy::Daily | RotationPolicy::Hourly => {
-                let date_str = match &self.rotation {
-                    RotationPolicy::Daily => {
-                        let d = rotation_date.unwrap_or_else(|| chrono::Local::now().date_naive());
-                        d.format("%Y-%m-%d").to_string()
-                    }
-                    RotationPolicy::Hourly => {
-                        let (d, h) = rotation_hour.unwrap_or_else(|| {
-                            let now = chrono::Local::now();
-                            (now.date_naive(), now.hour())
-                        });
-                        format!("{}-{:02}", d.format("%Y-%m-%d"), h)
-                    }
-                    _ => unreachable!(),
-                };
-
-                let mut dest_path = self.log_dir.join(format!("{}.{}.log", self.file_name, date_str));
-                if dest_path.exists() {
-                    let mut index = 1;
-                    loop {
-                        let test_path = self.log_dir.join(format!("{}.{}.{}.log", self.file_name, date_str, index));
-                        if !test_path.exists() {
-                            dest_path = test_path;
-                            break;
-                        }
-                        index += 1;
-                    }
-                }
-                std::fs::rename(file_path, dest_path)?;
-            }
             RotationPolicy::SizeMB(_) => {
                 self.rotate_size(file_path)?;
+            }
+            RotationPolicy::Daily | RotationPolicy::Hourly => {
+                let staging_path = unique_staging_path(&self.log_dir, &self.file_name);
+                std::fs::rename(file_path, &staging_path)?;
+
+                let log_dir = self.log_dir.clone();
+                let file_name = self.file_name.clone();
+                let rotation = self.rotation.clone();
+
+                std::thread::spawn(move || {
+                    let date_str = match rotation {
+                        RotationPolicy::Daily => {
+                            let d = rotation_date.unwrap_or_else(|| chrono::Local::now().date_naive());
+                            d.format("%Y-%m-%d").to_string()
+                        }
+                        RotationPolicy::Hourly => {
+                            let (d, h) = rotation_hour.unwrap_or_else(|| {
+                                let now = chrono::Local::now();
+                                (now.date_naive(), now.hour())
+                            });
+                            format!("{}-{:02}", d.format("%Y-%m-%d"), h)
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    let mut dest_path = log_dir.join(format!("{}.{}.log", file_name, date_str));
+                    if dest_path.exists() {
+                        let mut index = 1;
+                        loop {
+                            let test_path = log_dir.join(format!("{}.{}.{}.log", file_name, date_str, index));
+                            if !test_path.exists() {
+                                dest_path = test_path;
+                                break;
+                            }
+                            index += 1;
+                        }
+                    }
+                    let _ = std::fs::rename(&staging_path, dest_path);
+                });
             }
             RotationPolicy::Never => {}
         }
@@ -726,49 +735,58 @@ impl OwlRollingFileWriter {
     }
 
     fn rotate_size(&mut self, file_path: &std::path::Path) -> std::io::Result<()> {
-        if let Some(max_files) = self.max_files {
-            if max_files > 1 {
-                let n = max_files - 1;
-                let oldest_gz = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, n));
-                let oldest_log = self.log_dir.join(format!("{}.{}.log", self.file_name, n));
-                let _ = std::fs::remove_file(oldest_gz);
-                let _ = std::fs::remove_file(oldest_log);
+        let staging_path = unique_staging_path(&self.log_dir, &self.file_name);
+        std::fs::rename(file_path, &staging_path)?;
 
-                for i in (1..n).rev() {
-                    let src_gz = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, i));
-                    let dest_gz = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, i + 1));
-                    if src_gz.exists() {
-                        std::fs::rename(src_gz, dest_gz)?;
+        let log_dir = self.log_dir.clone();
+        let file_name = self.file_name.clone();
+        let max_files = self.max_files;
+
+        std::thread::spawn(move || {
+            if let Some(max_files) = max_files {
+                if max_files > 1 {
+                    let n = max_files - 1;
+                    let oldest_gz = log_dir.join(format!("{}.{}.log.gz", file_name, n));
+                    let oldest_log = log_dir.join(format!("{}.{}.log", file_name, n));
+                    let _ = std::fs::remove_file(oldest_gz);
+                    let _ = std::fs::remove_file(oldest_log);
+
+                    for i in (1..n).rev() {
+                        let src_gz = log_dir.join(format!("{}.{}.log.gz", file_name, i));
+                        let dest_gz = log_dir.join(format!("{}.{}.log.gz", file_name, i + 1));
+                        if src_gz.exists() {
+                            let _ = std::fs::rename(src_gz, dest_gz);
+                        }
+                        let src_log = log_dir.join(format!("{}.{}.log", file_name, i));
+                        let dest_log = log_dir.join(format!("{}.{}.log", file_name, i + 1));
+                        if src_log.exists() {
+                            let _ = std::fs::rename(src_log, dest_log);
+                        }
                     }
-                    let src_log = self.log_dir.join(format!("{}.{}.log", self.file_name, i));
-                    let dest_log = self.log_dir.join(format!("{}.{}.log", self.file_name, i + 1));
-                    if src_log.exists() {
-                        std::fs::rename(src_log, dest_log)?;
-                    }
+
+                    let dest_gz = log_dir.join(format!("{}.1.log.gz", file_name));
+                    compress_file_sync(staging_path, dest_gz);
+                } else {
+                    let _ = std::fs::remove_file(staging_path);
                 }
-
-                let dest = self.log_dir.join(format!("{}.1.log", self.file_name));
-                std::fs::rename(file_path, &dest)?;
-
-                let dest_gz = self.log_dir.join(format!("{}.1.log.gz", self.file_name));
-                compress_file_in_background(dest, dest_gz);
             } else {
-                let _ = std::fs::remove_file(file_path);
-            }
-        } else {
-            let mut index = 1;
-            let backup_log = loop {
-                let backup_gz_path = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, index));
-                let backup_log_path = self.log_dir.join(format!("{}.{}.log", self.file_name, index));
-                if !backup_gz_path.exists() && !backup_log_path.exists() {
-                    break backup_log_path;
+                let mut index = 1;
+                let backup_log = loop {
+                    let backup_gz_path = log_dir.join(format!("{}.{}.log.gz", file_name, index));
+                    let backup_log_path = log_dir.join(format!("{}.{}.log", file_name, index));
+                    if !backup_gz_path.exists() && !backup_log_path.exists() {
+                        break backup_log_path;
+                    }
+                    index += 1;
+                };
+                let backup_gz = log_dir.join(format!("{}.{}.log.gz", file_name, index));
+                if std::fs::rename(&staging_path, &backup_log).is_ok() {
+                    compress_file_sync(backup_log, backup_gz);
+                } else {
+                    let _ = std::fs::remove_file(staging_path);
                 }
-                index += 1;
-            };
-            let backup_gz = self.log_dir.join(format!("{}.{}.log.gz", self.file_name, index));
-            std::fs::rename(file_path, &backup_log)?;
-            compress_file_in_background(backup_log, backup_gz);
-        }
+            }
+        });
         Ok(())
     }
 
@@ -848,29 +866,38 @@ impl std::io::Write for OwlRollingFileWriter {
     }
 }
 
-/// 后台压缩文件逻辑
-fn compress_file_in_background(src_path: std::path::PathBuf, dest_path: std::path::PathBuf) {
-    std::thread::spawn(move || {
-        let tmp_path = unique_temp_gzip_path(&dest_path);
-        let compress_res = (|| -> std::io::Result<()> {
-            let src = std::fs::File::open(&src_path)?;
-            let dest = std::fs::File::create(&tmp_path)?;
-            let mut encoder = flate2::write::GzEncoder::new(dest, flate2::Compression::default());
-            let mut reader = std::io::BufReader::new(src);
-            std::io::copy(&mut reader, &mut encoder)?;
-            encoder.finish()?;
-            if dest_path.exists() {
-                let _ = std::fs::remove_file(&dest_path);
-            }
-            std::fs::rename(&tmp_path, &dest_path)?;
-            Ok(())
-        })();
-        if compress_res.is_ok() {
-            let _ = std::fs::remove_file(src_path);
-        } else {
-            let _ = std::fs::remove_file(tmp_path);
+fn unique_staging_path(log_dir: &std::path::Path, file_name: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let thread_id = format!("{:?}", std::thread::current().id());
+    log_dir.join(format!(
+        "{}.rotate-staging.{}.{}.log",
+        file_name, nanos, thread_id
+    ))
+}
+
+fn compress_file_sync(src_path: std::path::PathBuf, dest_path: std::path::PathBuf) {
+    let tmp_path = unique_temp_gzip_path(&dest_path);
+    let compress_res = (|| -> std::io::Result<()> {
+        let src = std::fs::File::open(&src_path)?;
+        let dest = std::fs::File::create(&tmp_path)?;
+        let mut encoder = flate2::write::GzEncoder::new(dest, flate2::Compression::default());
+        let mut reader = std::io::BufReader::new(src);
+        std::io::copy(&mut reader, &mut encoder)?;
+        encoder.finish()?;
+        if dest_path.exists() {
+            let _ = std::fs::remove_file(&dest_path);
         }
-    });
+        std::fs::rename(&tmp_path, &dest_path)?;
+        Ok(())
+    })();
+    if compress_res.is_ok() {
+        let _ = std::fs::remove_file(src_path);
+    } else {
+        let _ = std::fs::remove_file(tmp_path);
+    }
 }
 
 fn unique_temp_gzip_path(dest_path: &std::path::Path) -> std::path::PathBuf {
@@ -1096,6 +1123,9 @@ mod tests {
         std::io::Write::write_all(&mut writer, b"hello day 2\n").unwrap();
         std::io::Write::flush(&mut writer).unwrap();
 
+        // Wait a short duration for the background thread to complete the rotation
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
         // The old file should be rotated to test_daily.YYYY-MM-DD.log (using the yesterday's date)
         let expected_rotated_name = format!("{}.{}.log", file_name, yesterday.format("%Y-%m-%d"));
         let rotated_path = temp_dir.join(&expected_rotated_name);
@@ -1141,6 +1171,9 @@ mod tests {
         // Next write triggers hourly rotation
         std::io::Write::write_all(&mut writer, b"hello hour 2\n").unwrap();
         std::io::Write::flush(&mut writer).unwrap();
+
+        // Wait a short duration for the background thread to complete the rotation
+        std::thread::sleep(std::time::Duration::from_millis(150));
 
         let expected_rotated_name = format!("{}.{}-{:02}.log", file_name, active_hour_val.0.format("%Y-%m-%d"), active_hour_val.1);
         let rotated_path = temp_dir.join(&expected_rotated_name);
