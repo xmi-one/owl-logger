@@ -28,7 +28,7 @@
 
 ```toml
 [dependencies]
-owl-logger = "0.2.3"
+owl-logger = "0.2.4"
 ```
 
 MSRV：Rust 1.88。
@@ -246,7 +246,7 @@ let _guard = owl_logger::builder()
 
 ```toml
 [dependencies]
-owl-logger = { version = "0.2.3", features = ["otlp"] }
+owl-logger = { version = "0.2.4", features = ["otlp"] }
 ```
 
 ```rust
