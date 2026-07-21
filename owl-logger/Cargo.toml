@@ -2,7 +2,7 @@
 name = "owl-logger"
 version = "0.2.3"
 edition = "2021"
-rust-version = "1.70.0"
+rust-version = "1.88.0"
 description = "A production-ready, ergonomic logging library for Rust — inspired by Python's xmi_logger, powered by tracing."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xmi-one/owl-logger"

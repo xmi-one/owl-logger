@@ -17,16 +17,16 @@ fn unique_temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-// 辅助函数：将文件的修改时间设置为很久以前（2020-01-01），模拟过期文件
+// 辅助函数：将文件的修改时间设置为很久以前（2020-01-01），模拟过期文件。
+// 使用标准库 API，避免依赖 Unix 的 touch 命令。
 fn set_expired_time(path: &Path) {
-    let status = std::process::Command::new("touch")
-        .args(&["-t", "202001010000", path.to_str().unwrap()])
-        .status();
-    assert!(
-        status.map(|s| s.success()).unwrap_or(false),
-        "Failed to set expired time for {:?}",
-        path
-    );
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("test file must be openable");
+    let expired_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+    file.set_times(std::fs::FileTimes::new().set_modified(expired_at))
+        .expect("test file timestamp must be settable");
 }
 
 #[test]
@@ -39,6 +39,8 @@ fn test_cleanup_isolation_and_active_protection() {
     let expired_rolled_log = dir.join("app.1.log");
     let expired_date_log = dir.join("app.log.2020-01-01");
     let expired_error_rolled_log = dir.join("app.error.1.log");
+    // 名称接近但不是 owl-logger 产生的文件，必须保留。
+    let user_backup = dir.join("app.log.backup");
 
     // 其他组件的日志文件（如 app.helper）
     let helper_active_log = dir.join("app.helper.log");
@@ -52,6 +54,7 @@ fn test_cleanup_isolation_and_active_protection() {
         &expired_rolled_log,
         &expired_date_log,
         &expired_error_rolled_log,
+        &user_backup,
         &helper_active_log,
         &helper_rolled_log,
         &helper_date_log,
@@ -75,18 +78,46 @@ fn test_cleanup_isolation_and_active_protection() {
     // 3. 验证清理结果
 
     // A. 活跃文件保护：正在写入的活跃日志文件即便过期，也绝对不应该被清理
-    assert!(active_log.exists(), "Active log file app.log must be protected from deletion");
-    assert!(active_error_log.exists(), "Active error log file app.error.log must be protected from deletion");
+    assert!(
+        active_log.exists(),
+        "Active log file app.log must be protected from deletion"
+    );
+    assert!(
+        active_error_log.exists(),
+        "Active error log file app.error.log must be protected from deletion"
+    );
 
     // B. 清理过期文件：属于当前组件的、已过期的轮转/备份日志，必须被成功删除
-    assert!(!expired_rolled_log.exists(), "Expired rolled log app.1.log should be cleaned up");
-    assert!(!expired_date_log.exists(), "Expired date log app.log.2020-01-01 should be cleaned up");
-    assert!(!expired_error_rolled_log.exists(), "Expired error rolled log app.error.1.log should be cleaned up");
+    assert!(
+        !expired_rolled_log.exists(),
+        "Expired rolled log app.1.log should be cleaned up"
+    );
+    assert!(
+        !expired_date_log.exists(),
+        "Expired date log app.log.2020-01-01 should be cleaned up"
+    );
+    assert!(
+        !expired_error_rolled_log.exists(),
+        "Expired error rolled log app.error.1.log should be cleaned up"
+    );
+    assert!(
+        user_backup.exists(),
+        "User-managed file app.log.backup must not be deleted"
+    );
 
     // C. 隔离性保护：属于其他组件（app.helper）的日志文件（无论活跃与否、过期与否），绝不能被误删
-    assert!(helper_active_log.exists(), "Other app's active log app.helper.log must not be deleted");
-    assert!(helper_rolled_log.exists(), "Other app's rolled log app.helper.1.log must not be deleted");
-    assert!(helper_date_log.exists(), "Other app's date log app.helper.log.2020-01-01 must not be deleted");
+    assert!(
+        helper_active_log.exists(),
+        "Other app's active log app.helper.log must not be deleted"
+    );
+    assert!(
+        helper_rolled_log.exists(),
+        "Other app's rolled log app.helper.1.log must not be deleted"
+    );
+    assert!(
+        helper_date_log.exists(),
+        "Other app's date log app.helper.log.2020-01-01 must not be deleted"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

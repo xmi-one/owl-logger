@@ -1,0 +1,9 @@
+[package]
+name = "owl-logger-macro-fixture"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88.0"
+publish = false
+
+[dependencies]
+owl_logger_alias = { package = "owl-logger", path = "../owl-logger" }

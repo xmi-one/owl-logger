@@ -6,7 +6,7 @@ fn main() {
     let _guard = owl_logger::builder()
         .file_name("panic_example")
         .log_dir("logs")
-        .catch_panic(true) // 显式开启捕获崩溃（默认即为 true）
+        .catch_panic(true) // 显式开启进程级 panic hook
         .init();
 
     owl_logger::info!("程序正常启动，准备触发一个 panic 崩溃...");

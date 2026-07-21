@@ -25,12 +25,16 @@ fn json_output_protects_reserved_keys_from_collisions() {
             .format(OutputFormat::Json)
             .rotation(RotationPolicy::Never)
             .global_field("message", "global_msg_attempt") // 全局字段冲突尝试
-            .global_field("level", "global_lvl_attempt")     // 全局字段冲突尝试
+            .global_field("level", "global_lvl_attempt") // 全局字段冲突尝试
             .catch_panic(false)
             .init();
 
         // 创建带有冲突字段的 Span，并在其中发送带有冲突字段的日志
-        let span = tracing::info_span!("my_span", message = "span_msg_attempt", level = "span_lvl_attempt");
+        let span = tracing::info_span!(
+            "my_span",
+            message = "span_msg_attempt",
+            level = "span_lvl_attempt"
+        );
         let _enter = span.enter();
 
         tracing::info!(
@@ -58,9 +62,18 @@ fn json_output_protects_reserved_keys_from_collisions() {
 
     // 验证冲突的自定义字段已被添加了下划线前缀，没有丢失数据
     // 注意：事件字段最后写入，因此事件中的同名冲突字段最终会在 log_obj 中生效
-    assert!(value["_message"].is_string(), "colliding message key must be prefixed");
-    assert!(value["_level"].is_string(), "colliding level key must be prefixed");
-    assert_eq!(value["_timestamp"], "event_ts_attempt", "colliding timestamp key must be prefixed");
+    assert!(
+        value["_message"].is_string(),
+        "colliding message key must be prefixed"
+    );
+    assert!(
+        value["_level"].is_string(),
+        "colliding level key must be prefixed"
+    );
+    assert_eq!(
+        value["_timestamp"], "event_ts_attempt",
+        "colliding timestamp key must be prefixed"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

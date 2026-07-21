@@ -46,6 +46,9 @@
 //! `init()` 和 `builder().init()` 返回的 `OwlGuard` **必须被持有**（通常用 `let _guard = ...`）。
 //! 当 Guard 被丢弃时，会自动 flush 所有缓冲的日志。如果不持有 Guard，日志可能会丢失。
 
+// 供 #[monitor] 在库本体、示例和外部依赖重命名场景中使用统一的绝对路径。
+extern crate self as owl_logger;
+
 mod builder;
 mod config;
 pub mod context;
@@ -59,7 +62,7 @@ mod i18n;
 pub use builder::OwlLoggerBuilder;
 pub use config::{Language, LogLevel, OutputFormat, RotationPolicy};
 pub use error::OwlError;
-pub use guard::OwlGuard;
+pub use guard::{DroppedLogLines, OwlGuard};
 
 // Re-export 过程宏
 pub use owl_logger_macros::monitor;
@@ -69,6 +72,22 @@ pub use tracing::instrument;
 pub use tracing::Instrument;
 pub use tracing::{debug, error, info, trace, warn};
 pub use tracing::{debug_span, error_span, info_span, trace_span, warn_span};
+
+/// 创建一个具有编译期确定名称和字段的上下文 Span。
+///
+/// 该 macro 使用 ERROR 级别，使请求/业务上下文也能在只保留错误日志的生产过滤器中
+/// 被记录。同步代码可调用 returned Span 的 entered 方法；异步代码可配合 Instrument。
+///
+/// ```rust,no_run
+/// let span = owl_logger::context_span!("order", order_id = "ORD-1", attempt = 1);
+/// let _entered = span.enter();
+/// ```
+#[macro_export]
+macro_rules! context_span {
+    ($name:literal $(, $field:ident = $value:expr)* $(,)?) => {
+        $crate::error_span!($name $(, $field = %$value)*)
+    };
+}
 
 /// 创建一个新的 Builder 实例
 ///
@@ -91,6 +110,8 @@ pub fn builder() -> OwlLoggerBuilder {
 /// - `OWL_LOG_FORMAT`: `pretty` / `compact` / `json`
 /// - `OWL_LOG_DIR`: 日志目录
 /// - `OWL_LOG_FILE`: 日志文件名前缀
+///
+/// 若 `RUST_LOG` 存在且是有效的 tracing filter，它会优先于基础 level 配置生效。
 pub fn builder_from_env() -> Result<OwlLoggerBuilder, OwlError> {
     OwlLoggerBuilder::from_env()
 }
@@ -133,9 +154,7 @@ pub fn try_init_from_env() -> Result<OwlGuard, OwlError> {
 /// 动态获取当前的日志过滤器规则
 pub fn get_filter() -> Result<String, OwlError> {
     if let Some(handle) = crate::builder::RELOAD_HANDLE.get() {
-        Ok(handle
-            .with_current(|filter| filter.to_string())
-            .unwrap_or_default())
+        handle.current_filter().map_err(OwlError::Reload)
     } else {
         Err(OwlError::NotInitialized)
     }
@@ -147,16 +166,17 @@ pub fn set_filter(filter_str: impl AsRef<str>) -> Result<(), OwlError> {
         let filter_str = filter_str.as_ref();
         let new_filter = tracing_subscriber::EnvFilter::try_new(filter_str)
             .map_err(|e| OwlError::EnvFilter(e.to_string()))?;
-        handle
-            .reload(new_filter)
-            .map_err(|e| OwlError::Reload(e.to_string()))?;
+        handle.reload_filter(new_filter).map_err(OwlError::Reload)?;
         Ok(())
     } else {
         Err(OwlError::NotInitialized)
     }
 }
 
-/// 动态更新全局日志级别
+/// 动态更新全局日志级别。
+///
+/// 此操作会用一个新的全局级别替换当前完整 filter；若需要保留目标级别规则，请使用
+/// set_filter。
 pub fn set_level(level: LogLevel) -> Result<(), OwlError> {
     set_filter(level.to_string())
 }

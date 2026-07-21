@@ -159,7 +159,7 @@ impl Default for OwlConfig {
             time_format: "%Y-%m-%d %H:%M:%S%.3f".to_string(),
             use_utc: false,
             max_files: None,
-            catch_panic: true,
+            catch_panic: false,
             global_fields: std::collections::HashMap::new(),
             sensitive_keys: vec![
                 "password".to_string(),
@@ -175,5 +175,15 @@ impl Default for OwlConfig {
             otlp_endpoint: None,
             otlp_service_name: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OwlConfig;
+
+    #[test]
+    fn panic_hook_is_opt_in_by_default() {
+        assert!(!OwlConfig::default().catch_panic);
     }
 }

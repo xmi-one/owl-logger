@@ -8,23 +8,65 @@ use crate::guard::OwlGuard;
 use crate::i18n::I18n;
 use chrono::Timelike;
 
-/// 全局日志过滤器重载句柄，用于在运行期修改日志过滤器级别
-pub(crate) static RELOAD_HANDLE: std::sync::OnceLock<
-    tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>,
-> = std::sync::OnceLock::new();
-
-/// 自定义时间戳格式化器，实现 tracing_subscriber 的 FormatTime
-struct OwlTime {
-    format: String,
-    use_utc: bool,
+/// 擦除 subscriber 类型后的可重载过滤器。
+///
+/// 这让全局动态过滤 API 同时支持默认 Registry 和调用方预先组合的 subscriber。
+pub(crate) trait ReloadableFilter: Send + Sync {
+    fn current_filter(&self) -> Result<String, String>;
+    fn reload_filter(&self, filter: EnvFilter) -> Result<(), String>;
 }
 
-impl tracing_subscriber::fmt::time::FormatTime for OwlTime {
-    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
-        if self.use_utc {
-            write!(w, "{}", chrono::Utc::now().format(&self.format))
-        } else {
-            write!(w, "{}", chrono::Local::now().format(&self.format))
+impl<S> ReloadableFilter for tracing_subscriber::reload::Handle<EnvFilter, S>
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    fn current_filter(&self) -> Result<String, String> {
+        self.with_current(|filter| filter.to_string())
+            .map_err(|error| error.to_string())
+    }
+
+    fn reload_filter(&self, filter: EnvFilter) -> Result<(), String> {
+        self.reload(filter).map_err(|error| error.to_string())
+    }
+}
+
+/// 全局日志过滤器重载句柄，用于在运行期修改日志过滤器级别。
+pub(crate) static RELOAD_HANDLE: std::sync::OnceLock<Box<dyn ReloadableFilter>> =
+    std::sync::OnceLock::new();
+
+/// 周期性保留期清理任务。
+///
+/// 由 OwlGuard 持有；Drop 时发送停止信号并等待线程退出，避免 logger 已关闭后仍有
+/// 清理线程访问日志目录。
+pub(crate) struct CleanupWorker {
+    stop_sender: Option<std::sync::mpsc::Sender<()>>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CleanupWorker {
+    fn start(log_dir: std::path::PathBuf, file_name: String, retention_days: usize) -> Self {
+        let (stop_sender, stop_receiver) = std::sync::mpsc::channel();
+        let join_handle = std::thread::spawn(move || loop {
+            match stop_receiver.recv_timeout(std::time::Duration::from_secs(3600)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    cleanup_old_logs(&log_dir, &file_name, retention_days);
+                }
+            }
+        });
+
+        Self {
+            stop_sender: Some(stop_sender),
+            join_handle: Some(join_handle),
+        }
+    }
+}
+
+impl Drop for CleanupWorker {
+    fn drop(&mut self) {
+        self.stop_sender.take();
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.join();
         }
     }
 }
@@ -61,6 +103,7 @@ impl OwlLoggerBuilder {
             builder = builder.file_name(file_name);
         }
 
+        validate_config(&builder.config)?;
         Ok(builder)
     }
 
@@ -149,12 +192,17 @@ impl OwlLoggerBuilder {
     }
 
     /// 设置最大日志文件保留数量
+    ///
+    /// 上限包含当前活跃日志文件；传入 `0` 表示不限制数量。
     pub fn max_files(mut self, max_files: usize) -> Self {
         self.config.max_files = Some(max_files);
         self
     }
 
-    /// 设置是否捕获 Panic 并通过日志输出
+    /// 设置是否捕获 Panic 并通过日志输出。
+    ///
+    /// 该选项会替换进程级 panic hook，因此默认关闭。建议只在应用程序入口显式启用，
+    /// 不要由可复用库开启。
     pub fn catch_panic(mut self, catch: bool) -> Self {
         self.config.catch_panic = catch;
         self
@@ -233,9 +281,41 @@ impl OwlLoggerBuilder {
             .expect("owl-logger: failed to initialize. Is the global subscriber already set?")
     }
 
+    /// 使用调用方提供的 subscriber 构建并初始化全局日志系统。
+    ///
+    /// 可先将应用自定义的 tracing Layer 叠加到 Registry，再交给 owl-logger 添加格式化、
+    /// 文件输出和动态过滤能力。该方法与 init 一样会安装全局 subscriber。
+    pub fn init_with_subscriber<S>(self, subscriber: S) -> OwlGuard
+    where
+        S: tracing::Subscriber
+            + for<'a> tracing_subscriber::registry::LookupSpan<'a>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.try_init_with_subscriber(subscriber)
+            .expect("owl-logger: failed to initialize. Is the global subscriber already set?")
+    }
+
     /// 尝试构建并初始化全局日志 subscriber
     pub fn try_init(self) -> Result<OwlGuard, OwlError> {
+        self.try_init_with_subscriber(tracing_subscriber::registry())
+    }
+
+    /// 尝试使用调用方提供的 subscriber 初始化日志系统。
+    ///
+    /// 与 try_init 相同，但允许应用在初始化前组合额外 Layer。全局 subscriber 已设置时
+    /// 返回 OwlError::AlreadyInitialized。
+    pub fn try_init_with_subscriber<S>(self, subscriber: S) -> Result<OwlGuard, OwlError>
+    where
+        S: tracing::Subscriber
+            + for<'a> tracing_subscriber::registry::LookupSpan<'a>
+            + Send
+            + Sync
+            + 'static,
+    {
         let config = self.config;
+        validate_config(&config)?;
 
         // 构建环境过滤器
         let env_filter = EnvFilter::try_from_default_env()
@@ -243,12 +323,8 @@ impl OwlLoggerBuilder {
 
         let mut console_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
         let mut file_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
-
-        // 公用计时器
-        let timer = OwlTime {
-            format: config.time_format.clone(),
-            use_utc: config.use_utc,
-        };
+        let mut console_dropped_lines = None;
+        let mut file_dropped_lines = None;
 
         // 构建控制台输出层
         let console_layer = if config.enable_console {
@@ -257,6 +333,7 @@ impl OwlLoggerBuilder {
                     .buffered_lines_limit(config.buffered_lines_limit)
                     .lossy(config.lossy)
                     .finish(std::io::stderr());
+            console_dropped_lines = Some(non_blocking.error_counter());
             console_guard = Some(guard);
 
             let layer = match config.format {
@@ -275,12 +352,14 @@ impl OwlLoggerBuilder {
                         .event_format(json_fmt)
                         .boxed()
                 }
-                OutputFormat::Compact => tracing_subscriber::fmt::layer()
-                    .with_writer(non_blocking)
-                    .compact()
-                    .with_timer(timer)
-                    .with_ansi(config.enable_ansi)
-                    .boxed(),
+                OutputFormat::Compact => {
+                    let fmt = formatter::console_compact_formatter(config.language, &config);
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(non_blocking)
+                        .event_format(fmt)
+                        .with_ansi(config.enable_ansi)
+                        .boxed()
+                }
                 OutputFormat::Pretty => {
                     let fmt = formatter::console_formatter(config.language, &config);
                     tracing_subscriber::fmt::layer()
@@ -296,6 +375,7 @@ impl OwlLoggerBuilder {
         };
 
         let mut error_file_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
+        let mut error_file_dropped_lines = None;
 
         // 若启用文件输出或分级文件输出，先确保目录存在并清理一次过期日志
         if config.enable_file || config.error_file_level.is_some() {
@@ -317,6 +397,7 @@ impl OwlLoggerBuilder {
                     .buffered_lines_limit(config.buffered_lines_limit)
                     .lossy(config.lossy)
                     .finish(file_writer);
+            file_dropped_lines = Some(non_blocking.error_counter());
             file_guard = Some(guard);
             Some(build_file_fmt_layer(&config, non_blocking))
         } else {
@@ -332,6 +413,7 @@ impl OwlLoggerBuilder {
                     .buffered_lines_limit(config.buffered_lines_limit)
                     .lossy(config.lossy)
                     .finish(writer);
+            error_file_dropped_lines = Some(non_blocking.error_counter());
             error_file_guard = Some(guard);
             // 仅放行达到或严重于阈值的日志（LevelFilter 语义：WARN 放行 WARN+ERROR）
             let level_filter =
@@ -364,7 +446,7 @@ impl OwlLoggerBuilder {
 
         // 初始化全局注册表
         // OwlSpanLayer 负责把 span 字段以结构化形式存入 extensions，供格式化器直接读取
-        tracing_subscriber::registry()
+        subscriber
             .with(env_filter_layer)
             .with(formatter::OwlSpanLayer)
             .with(otel_layer)
@@ -374,7 +456,7 @@ impl OwlLoggerBuilder {
             .try_init()
             .map_err(|_| OwlError::AlreadyInitialized)?;
         RELOAD_HANDLE
-            .set(reload_handle)
+            .set(Box::new(reload_handle))
             .map_err(|_| OwlError::AlreadyInitialized)?;
 
         // 桥接 log crate
@@ -423,15 +505,18 @@ impl OwlLoggerBuilder {
             }));
         }
 
-        // 启动后台过期的日志周期清理线程 (每小时扫描一次)
-        if let Some(retention_days) = config.retention_days {
-            let log_dir = std::path::PathBuf::from(&config.log_dir);
-            let file_name = config.file_name.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(3600));
-                cleanup_old_logs(&log_dir, &file_name, retention_days);
-            });
-        }
+        // 启动后台过期日志周期清理任务（每小时扫描一次），由 Guard 在关闭时停止。
+        let cleanup_worker = if config.enable_file || config.error_file_level.is_some() {
+            config.retention_days.map(|retention_days| {
+                CleanupWorker::start(
+                    std::path::PathBuf::from(&config.log_dir),
+                    config.file_name.clone(),
+                    retention_days,
+                )
+            })
+        } else {
+            None
+        };
 
         // 设置全局语言状态供 #[monitor] 宏查询
         crate::__private::set_language(config.language);
@@ -440,9 +525,13 @@ impl OwlLoggerBuilder {
         tracing::info!("{}", I18n::init_message(config.language));
 
         Ok(OwlGuard {
+            _cleanup_worker: cleanup_worker,
             _file_guard: file_guard,
             _console_guard: console_guard,
             _error_file_guard: error_file_guard,
+            _file_dropped_lines: file_dropped_lines,
+            _console_dropped_lines: console_dropped_lines,
+            _error_file_dropped_lines: error_file_dropped_lines,
             #[cfg(feature = "otlp")]
             _otel_provider,
             language: config.language,
@@ -529,14 +618,10 @@ where
                 .boxed()
         }
         OutputFormat::Compact => {
-            let timer = OwlTime {
-                format: config.time_format.clone(),
-                use_utc: config.use_utc,
-            };
+            let fmt = formatter::file_compact_formatter(config.language, config);
             tracing_subscriber::fmt::layer()
                 .with_writer(non_blocking)
-                .compact()
-                .with_timer(timer)
+                .event_format(fmt)
                 .with_ansi(false)
                 .boxed()
         }
@@ -577,6 +662,58 @@ fn parse_output_format(value: &str) -> Result<OutputFormat, OwlError> {
     }
 }
 
+/// 校验日志文件名前缀，确保它始终位于日志目录下。
+///
+/// file_name 是前缀而非路径，因此只接受单个普通路径组件。额外检查 Windows
+/// 路径分隔符与盘符形式，使在 Unix 上读取环境变量时也不会放行跨平台危险值。
+fn validate_file_name(file_name: &str) -> Result<(), OwlError> {
+    let mut components = std::path::Path::new(file_name).components();
+    let is_single_normal_component =
+        matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none();
+    let has_windows_drive_prefix = file_name.len() >= 2
+        && file_name.as_bytes()[0].is_ascii_alphabetic()
+        && file_name.as_bytes()[1] == b':';
+
+    if file_name.is_empty()
+        || file_name.contains(['/', '\\', '\0'])
+        || has_windows_drive_prefix
+        || !is_single_normal_component
+    {
+        return Err(OwlError::Other(
+            "invalid log file name: use one non-empty file-name component without path separators"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_config(config: &OwlConfig) -> Result<(), OwlError> {
+    validate_file_name(&config.file_name)?;
+
+    if config.buffered_lines_limit == 0 {
+        return Err(OwlError::Other(
+            "invalid buffered lines limit: it must be greater than zero".to_string(),
+        ));
+    }
+
+    if let RotationPolicy::SizeMB(megabytes) = &config.rotation {
+        if *megabytes == 0 {
+            return Err(OwlError::Other(
+                "invalid size rotation: SizeMB must be greater than zero".to_string(),
+            ));
+        }
+        if megabytes.checked_mul(1024 * 1024).is_none() {
+            return Err(OwlError::Other(
+                "invalid size rotation: SizeMB is too large".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// 支持按时间（每天、每小时）或大小限制自动轮转，且活跃日志文件名不含时间戳的自定义文件写入器
 struct OwlRollingFileWriter {
     log_dir: std::path::PathBuf,
@@ -600,7 +737,7 @@ impl OwlRollingFileWriter {
         retention_days: Option<usize>,
     ) -> Self {
         let max_size = match &rotation {
-            RotationPolicy::SizeMB(mb) => mb * 1024 * 1024,
+            RotationPolicy::SizeMB(mb) => mb.saturating_mul(1024 * 1024),
             _ => 0,
         };
         Self {
@@ -608,7 +745,8 @@ impl OwlRollingFileWriter {
             file_name: file_name.into(),
             rotation,
             max_size,
-            max_files,
+            // 与 tracing-appender 的 max_log_files 保持一致：0 表示关闭数量上限。
+            max_files: max_files.filter(|&max_files| max_files > 0),
             retention_days,
             current_file: None,
             current_size: 0,
@@ -618,66 +756,67 @@ impl OwlRollingFileWriter {
     }
 
     fn init_file(&mut self) -> std::io::Result<&mut std::fs::File> {
-        if self.current_file.is_some() {
-            return Ok(self.current_file.as_mut().unwrap());
-        }
+        if self.current_file.is_none() {
+            let file_path = self.log_dir.join(format!("{}.log", self.file_name));
 
-        let file_path = self.log_dir.join(format!("{}.log", self.file_name));
-        
-        // 检查启动时是否需要轮转已经存在的老日志文件
-        if file_path.exists() {
-            let now = chrono::Local::now();
-            let mut rotate_needed = false;
-            let mut rotation_date = None;
-            let mut rotation_hour = None;
+            // 检查启动时是否需要轮转已经存在的老日志文件
+            if file_path.exists() {
+                let now = chrono::Local::now();
+                let mut rotate_needed = false;
+                let mut rotation_date = None;
+                let mut rotation_hour = None;
 
-            if let Ok(metadata) = file_path.metadata() {
-                if let Ok(modified) = metadata.modified() {
-                    let modified_local: chrono::DateTime<chrono::Local> = modified.into();
-                    match &self.rotation {
-                        RotationPolicy::Daily => {
-                            if modified_local.date_naive() != now.date_naive() {
-                                rotate_needed = true;
-                                rotation_date = Some(modified_local.date_naive());
+                if let Ok(metadata) = file_path.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        let modified_local: chrono::DateTime<chrono::Local> = modified.into();
+                        match &self.rotation {
+                            RotationPolicy::Daily => {
+                                if modified_local.date_naive() != now.date_naive() {
+                                    rotate_needed = true;
+                                    rotation_date = Some(modified_local.date_naive());
+                                }
                             }
-                        }
-                        RotationPolicy::Hourly => {
-                            let mod_hour = (modified_local.date_naive(), modified_local.hour());
-                            let now_hour = (now.date_naive(), now.hour());
-                            if mod_hour != now_hour {
-                                rotate_needed = true;
-                                rotation_hour = Some(mod_hour);
+                            RotationPolicy::Hourly => {
+                                let mod_hour = (modified_local.date_naive(), modified_local.hour());
+                                let now_hour = (now.date_naive(), now.hour());
+                                if mod_hour != now_hour {
+                                    rotate_needed = true;
+                                    rotation_hour = Some(mod_hour);
+                                }
                             }
-                        }
-                        RotationPolicy::SizeMB(_) => {
-                            if metadata.len() >= self.max_size {
-                                rotate_needed = true;
+                            RotationPolicy::SizeMB(_) => {
+                                if metadata.len() >= self.max_size {
+                                    rotate_needed = true;
+                                }
                             }
+                            RotationPolicy::Never => {}
                         }
-                        RotationPolicy::Never => {}
                     }
+                }
+
+                if rotate_needed {
+                    self.rotate_existing(&file_path, rotation_date, rotation_hour)?;
                 }
             }
 
-            if rotate_needed {
-                self.rotate_existing(&file_path, rotation_date, rotation_hour)?;
-            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file_path)?;
+
+            let metadata = file.metadata()?;
+            self.current_size = metadata.len();
+
+            let now = chrono::Local::now();
+            self.active_date = Some(now.date_naive());
+            self.active_hour = Some((now.date_naive(), now.hour()));
+            self.current_file = Some(file);
+            self.enforce_max_files()?;
         }
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&file_path)?;
-
-        let metadata = file.metadata()?;
-        self.current_size = metadata.len();
-        
-        let now = chrono::Local::now();
-        self.active_date = Some(now.date_naive());
-        self.active_hour = Some((now.date_naive(), now.hour()));
-        self.current_file = Some(file);
-
-        Ok(self.current_file.as_mut().unwrap())
+        self.current_file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("owl-logger: rolling file was not initialized"))
     }
 
     fn rotate_existing(
@@ -694,40 +833,43 @@ impl OwlRollingFileWriter {
                 let staging_path = unique_staging_path(&self.log_dir, &self.file_name);
                 std::fs::rename(file_path, &staging_path)?;
 
-                let log_dir = self.log_dir.clone();
-                let file_name = self.file_name.clone();
-                let rotation = self.rotation.clone();
-
-                std::thread::spawn(move || {
-                    let date_str = match rotation {
-                        RotationPolicy::Daily => {
-                            let d = rotation_date.unwrap_or_else(|| chrono::Local::now().date_naive());
-                            d.format("%Y-%m-%d").to_string()
-                        }
-                        RotationPolicy::Hourly => {
-                            let (d, h) = rotation_hour.unwrap_or_else(|| {
-                                let now = chrono::Local::now();
-                                (now.date_naive(), now.hour())
-                            });
-                            format!("{}-{:02}", d.format("%Y-%m-%d"), h)
-                        }
-                        _ => unreachable!(),
-                    };
-
-                    let mut dest_path = log_dir.join(format!("{}.{}.log", file_name, date_str));
-                    if dest_path.exists() {
-                        let mut index = 1;
-                        loop {
-                            let test_path = log_dir.join(format!("{}.{}.{}.log", file_name, date_str, index));
-                            if !test_path.exists() {
-                                dest_path = test_path;
-                                break;
-                            }
-                            index += 1;
-                        }
+                let date_str = match self.rotation {
+                    RotationPolicy::Daily => {
+                        let date =
+                            rotation_date.unwrap_or_else(|| chrono::Local::now().date_naive());
+                        date.format("%Y-%m-%d").to_string()
                     }
-                    let _ = std::fs::rename(&staging_path, dest_path);
-                });
+                    RotationPolicy::Hourly => {
+                        let (date, hour) = rotation_hour.unwrap_or_else(|| {
+                            let now = chrono::Local::now();
+                            (now.date_naive(), now.hour())
+                        });
+                        format!("{}-{hour:02}", date.format("%Y-%m-%d"))
+                    }
+                    _ => unreachable!("only time-based rotation reaches this branch"),
+                };
+
+                let mut dest_path = self
+                    .log_dir
+                    .join(format!("{}.{}.log", self.file_name, date_str));
+                if dest_path.exists() {
+                    let mut index = 1;
+                    loop {
+                        let candidate = self
+                            .log_dir
+                            .join(format!("{}.{}.{}.log", self.file_name, date_str, index));
+                        if !candidate.exists() {
+                            dest_path = candidate;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+
+                if let Err(error) = std::fs::rename(&staging_path, &dest_path) {
+                    let _ = std::fs::rename(&staging_path, file_path);
+                    return Err(error);
+                }
             }
             RotationPolicy::Never => {}
         }
@@ -738,62 +880,75 @@ impl OwlRollingFileWriter {
         let staging_path = unique_staging_path(&self.log_dir, &self.file_name);
         std::fs::rename(file_path, &staging_path)?;
 
-        let log_dir = self.log_dir.clone();
-        let file_name = self.file_name.clone();
-        let max_files = self.max_files;
+        if let Some(max_files) = self.max_files {
+            if max_files > 1 {
+                let oldest_index = max_files - 1;
+                remove_file_if_exists(
+                    &self
+                        .log_dir
+                        .join(format!("{}.{}.log.gz", self.file_name, oldest_index)),
+                )?;
+                remove_file_if_exists(
+                    &self
+                        .log_dir
+                        .join(format!("{}.{}.log", self.file_name, oldest_index)),
+                )?;
 
-        std::thread::spawn(move || {
-            if let Some(max_files) = max_files {
-                if max_files > 1 {
-                    let n = max_files - 1;
-                    let oldest_gz = log_dir.join(format!("{}.{}.log.gz", file_name, n));
-                    let oldest_log = log_dir.join(format!("{}.{}.log", file_name, n));
-                    let _ = std::fs::remove_file(oldest_gz);
-                    let _ = std::fs::remove_file(oldest_log);
-
-                    for i in (1..n).rev() {
-                        let src_gz = log_dir.join(format!("{}.{}.log.gz", file_name, i));
-                        let dest_gz = log_dir.join(format!("{}.{}.log.gz", file_name, i + 1));
-                        if src_gz.exists() {
-                            let _ = std::fs::rename(src_gz, dest_gz);
-                        }
-                        let src_log = log_dir.join(format!("{}.{}.log", file_name, i));
-                        let dest_log = log_dir.join(format!("{}.{}.log", file_name, i + 1));
-                        if src_log.exists() {
-                            let _ = std::fs::rename(src_log, dest_log);
-                        }
+                for index in (1..oldest_index).rev() {
+                    let source_gz = self
+                        .log_dir
+                        .join(format!("{}.{}.log.gz", self.file_name, index));
+                    let destination_gz =
+                        self.log_dir
+                            .join(format!("{}.{}.log.gz", self.file_name, index + 1));
+                    if source_gz.exists() {
+                        std::fs::rename(source_gz, destination_gz)?;
                     }
 
-                    let dest_gz = log_dir.join(format!("{}.1.log.gz", file_name));
-                    compress_file_sync(staging_path, dest_gz);
-                } else {
-                    let _ = std::fs::remove_file(staging_path);
+                    let source_log = self
+                        .log_dir
+                        .join(format!("{}.{}.log", self.file_name, index));
+                    let destination_log =
+                        self.log_dir
+                            .join(format!("{}.{}.log", self.file_name, index + 1));
+                    if source_log.exists() {
+                        std::fs::rename(source_log, destination_log)?;
+                    }
                 }
+
+                let destination_gz = self.log_dir.join(format!("{}.1.log.gz", self.file_name));
+                compress_file(&staging_path, &destination_gz)?;
             } else {
-                let mut index = 1;
-                let backup_log = loop {
-                    let backup_gz_path = log_dir.join(format!("{}.{}.log.gz", file_name, index));
-                    let backup_log_path = log_dir.join(format!("{}.{}.log", file_name, index));
-                    if !backup_gz_path.exists() && !backup_log_path.exists() {
-                        break backup_log_path;
-                    }
-                    index += 1;
-                };
-                let backup_gz = log_dir.join(format!("{}.{}.log.gz", file_name, index));
-                if std::fs::rename(&staging_path, &backup_log).is_ok() {
-                    compress_file_sync(backup_log, backup_gz);
-                } else {
-                    let _ = std::fs::remove_file(staging_path);
-                }
+                std::fs::remove_file(staging_path)?;
             }
-        });
+        } else {
+            let mut index = 1;
+            let backup_log = loop {
+                let backup_gz_path = self
+                    .log_dir
+                    .join(format!("{}.{}.log.gz", self.file_name, index));
+                let backup_log_path = self
+                    .log_dir
+                    .join(format!("{}.{}.log", self.file_name, index));
+                if !backup_gz_path.exists() && !backup_log_path.exists() {
+                    break backup_log_path;
+                }
+                index += 1;
+            };
+            let backup_gz = self
+                .log_dir
+                .join(format!("{}.{}.log.gz", self.file_name, index));
+            std::fs::rename(&staging_path, &backup_log)?;
+            compress_file(&backup_log, &backup_gz)?;
+        }
+
         Ok(())
     }
 
     fn rotate(&mut self, now: chrono::DateTime<chrono::Local>) -> std::io::Result<()> {
         self.current_file = None;
         let file_path = self.log_dir.join(format!("{}.log", self.file_name));
-        
+
         if file_path.exists() {
             let rotation_date = self.active_date;
             let rotation_hour = self.active_hour;
@@ -814,7 +969,19 @@ impl OwlRollingFileWriter {
         self.active_date = Some(now.date_naive());
         self.active_hour = Some((now.date_naive(), now.hour()));
         self.current_file = Some(file);
+        self.enforce_max_files()?;
 
+        Ok(())
+    }
+
+    /// 将当前前缀的日志文件数限制在 max_files 以内。
+    ///
+    /// 活跃的 `{file_name}.log` 始终保留，因此最多只保留 `max_files - 1` 个历史文件。
+    /// 这与 tracing-appender 的 max_log_files 语义一致，并适用于大小、按日和按小时轮转。
+    fn enforce_max_files(&self) -> std::io::Result<()> {
+        if let Some(max_files) = self.max_files {
+            prune_excess_historical_logs(&self.log_dir, &self.file_name, max_files)?;
+        }
         Ok(())
     }
 }
@@ -878,25 +1045,36 @@ fn unique_staging_path(log_dir: &std::path::Path, file_name: &str) -> std::path:
     ))
 }
 
-fn compress_file_sync(src_path: std::path::PathBuf, dest_path: std::path::PathBuf) {
-    let tmp_path = unique_temp_gzip_path(&dest_path);
-    let compress_res = (|| -> std::io::Result<()> {
-        let src = std::fs::File::open(&src_path)?;
+fn compress_file(src_path: &std::path::Path, dest_path: &std::path::Path) -> std::io::Result<()> {
+    let tmp_path = unique_temp_gzip_path(dest_path);
+    let result = (|| -> std::io::Result<()> {
+        let src = std::fs::File::open(src_path)?;
         let dest = std::fs::File::create(&tmp_path)?;
         let mut encoder = flate2::write::GzEncoder::new(dest, flate2::Compression::default());
         let mut reader = std::io::BufReader::new(src);
         std::io::copy(&mut reader, &mut encoder)?;
         encoder.finish()?;
         if dest_path.exists() {
-            let _ = std::fs::remove_file(&dest_path);
+            std::fs::remove_file(dest_path)?;
         }
-        std::fs::rename(&tmp_path, &dest_path)?;
+        std::fs::rename(&tmp_path, dest_path)?;
         Ok(())
     })();
-    if compress_res.is_ok() {
-        let _ = std::fs::remove_file(src_path);
+
+    if result.is_ok() {
+        std::fs::remove_file(src_path)?;
     } else {
         let _ = std::fs::remove_file(tmp_path);
+    }
+
+    result
+}
+
+fn remove_file_if_exists(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -914,29 +1092,27 @@ fn unique_temp_gzip_path(dest_path: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn is_daily_date_str(s: &str) -> bool {
-    if s.len() != 10 {
-        return false;
-    }
-    let bytes = s.as_bytes();
-    bytes[0..4].iter().all(|c| c.is_ascii_digit())
-        && bytes[4] == b'-'
-        && bytes[5..7].iter().all(|c| c.is_ascii_digit())
-        && bytes[7] == b'-'
-        && bytes[8..10].iter().all(|c| c.is_ascii_digit())
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
 }
 
 fn is_hourly_date_str(s: &str) -> bool {
-    if s.len() != 13 {
+    let Some((date, hour)) = s.rsplit_once('-') else {
         return false;
-    }
-    let bytes = s.as_bytes();
-    bytes[0..4].iter().all(|c| c.is_ascii_digit())
-        && bytes[4] == b'-'
-        && bytes[5..7].iter().all(|c| c.is_ascii_digit())
-        && bytes[7] == b'-'
-        && bytes[8..10].iter().all(|c| c.is_ascii_digit())
-        && bytes[10] == b'-'
-        && bytes[11..13].iter().all(|c| c.is_ascii_digit())
+    };
+
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
+        && hour
+            .parse::<u32>()
+            .is_ok_and(|hour| (0..=23).contains(&hour))
+}
+
+/// 兼容旧版时间轮转文件名：`{file}.log.YYYY-MM-DD` 或
+/// `{file}.log.YYYY-MM-DD-HH`。
+///
+/// 不做宽松的前缀匹配，避免把用户自行创建的 `{file}.log.backup` 等文件当成历史
+/// 日志删除。对无法确认归属的文件宁可保留，由用户自行处理。
+fn matches_legacy_time_rotation_suffix(suffix: &str) -> bool {
+    is_daily_date_str(suffix) || is_hourly_date_str(suffix)
 }
 
 fn matches_suffix(mut s: &str) -> bool {
@@ -965,9 +1141,13 @@ fn is_log_file_for_prefix_non_recursive(filename: &str, file_name: &str) -> bool
         return true;
     }
 
-    // 2. 匹配旧格式 {file_name}.log.YYYY-MM-DD... (Daily/Hourly 轮转文件)
+    // 2. 匹配旧格式 {file_name}.log.YYYY-MM-DD 或
+    // {file_name}.log.YYYY-MM-DD-HH（Daily/Hourly 轮转文件）。
     let log_dot = format!("{}.log.", file_name);
-    if filename.starts_with(&log_dot) {
+    if filename
+        .strip_prefix(&log_dot)
+        .is_some_and(matches_legacy_time_rotation_suffix)
+    {
         return true;
     }
 
@@ -1017,6 +1197,53 @@ fn is_log_file_for_prefix(filename: &str, file_name: &str) -> bool {
     false
 }
 
+/// 在不触及活跃日志的前提下，删除超过数量上限的最早历史日志。
+///
+/// 仅处理 `is_log_file_for_prefix_non_recursive` 能明确识别的文件，避免误删用户在同一
+/// 目录中维护的其他文件。修改时间不可读的文件会被保留，优先保证数据安全。
+fn prune_excess_historical_logs(
+    log_dir: &std::path::Path,
+    file_name: &str,
+    max_files: usize,
+) -> std::io::Result<()> {
+    let max_historical_files = max_files.saturating_sub(1);
+    let active_file = format!("{file_name}.log");
+    let mut historical_files = Vec::new();
+
+    for entry in std::fs::read_dir(log_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if filename == active_file || !is_log_file_for_prefix_non_recursive(filename, file_name) {
+            continue;
+        }
+
+        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        historical_files.push((modified, path));
+    }
+
+    historical_files.sort_by(|(left_time, left_path), (right_time, right_path)| {
+        left_time
+            .cmp(right_time)
+            .then_with(|| left_path.cmp(right_path))
+    });
+
+    let excess = historical_files.len().saturating_sub(max_historical_files);
+    for (_, path) in historical_files.into_iter().take(excess) {
+        std::fs::remove_file(path)?;
+    }
+
+    Ok(())
+}
+
 /// 清理过期日志文件
 fn cleanup_old_logs(log_dir: &std::path::Path, file_name: &str, retention_days: usize) {
     let now = std::time::SystemTime::now();
@@ -1040,9 +1267,9 @@ fn cleanup_old_logs(log_dir: &std::path::Path, file_name: &str, retention_days: 
                     // 1. 判断是否属于此日志文件的模式
                     if is_log_file_for_prefix(filename_str, file_name) {
                         // 2. 排除正在活跃写入的文件
-                        let is_active = filename_str == log_exact 
+                        let is_active = filename_str == log_exact
                             || active_error_log_prefixes.iter().any(|p| filename_str == p);
-                        
+
                         if !is_active {
                             if let Ok(metadata) = entry.metadata() {
                                 if let Ok(modified) = metadata.modified() {
@@ -1083,6 +1310,152 @@ mod tests {
     }
 
     #[test]
+    fn accepts_only_a_single_safe_log_file_name_component() {
+        for valid in ["app", "service.v1", ".hidden", "服务"] {
+            assert!(
+                validate_file_name(valid).is_ok(),
+                "expected {valid:?} to be accepted"
+            );
+        }
+
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "../app",
+            "nested/app",
+            "/tmp/app",
+            "\\server\\app",
+            "C:\\logs\\app",
+            "C:app",
+        ] {
+            assert!(
+                validate_file_name(invalid).is_err(),
+                "expected {invalid:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_matches_only_known_log_rotation_file_names() {
+        for filename in [
+            "app.1.log",
+            "app.1.log.gz",
+            "app.2026-07-21.log",
+            "app.2026-07-21-18.log.gz",
+            "app.2026-07-21.1.log",
+            "app.log.2026-07-21",
+            "app.log.2026-07-21-18",
+            "app.error.1.log",
+        ] {
+            assert!(
+                is_log_file_for_prefix(filename, "app"),
+                "expected {filename:?} to be recognized as an owl-logger file"
+            );
+        }
+
+        for filename in [
+            "app.helper.log",
+            "app.log.backup",
+            "app.log.2026-99-99",
+            "app.log.2026-07-21.backup",
+            "app.2026-99-99.log",
+            "app.2026-07-21-42.log",
+        ] {
+            assert!(
+                !is_log_file_for_prefix(filename, "app"),
+                "expected {filename:?} to be preserved"
+            );
+        }
+    }
+
+    #[test]
+    fn max_files_limits_time_rotated_logs_without_touching_the_active_file() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "owl-test-time-max-files-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut writer =
+            OwlRollingFileWriter::new(&temp_dir, "app", RotationPolicy::Daily, Some(2), None);
+        std::io::Write::write_all(&mut writer, b"first\n").unwrap();
+
+        let first_date = chrono::Local::now().date_naive() - chrono::Days::new(2);
+        writer.active_date = Some(first_date);
+        std::io::Write::write_all(&mut writer, b"second\n").unwrap();
+        let first_archive = temp_dir.join(format!("app.{}.log", first_date.format("%Y-%m-%d")));
+        assert!(first_archive.exists());
+
+        let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&first_archive)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+
+        let second_date = chrono::Local::now().date_naive() - chrono::Days::new(1);
+        writer.active_date = Some(second_date);
+        std::io::Write::write_all(&mut writer, b"third\n").unwrap();
+        drop(writer);
+
+        let second_archive = temp_dir.join(format!("app.{}.log", second_date.format("%Y-%m-%d")));
+        assert!(!first_archive.exists(), "the oldest archive must be pruned");
+        assert!(
+            second_archive.exists(),
+            "the most recent archive must remain"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.join("app.log")).unwrap(),
+            "third\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn zero_max_files_means_no_count_limit() {
+        let writer = OwlRollingFileWriter::new(
+            std::env::temp_dir(),
+            "no-limit",
+            RotationPolicy::Daily,
+            Some(0),
+            None,
+        );
+
+        assert_eq!(writer.max_files, None);
+    }
+
+    #[test]
+    fn rejects_invalid_runtime_configuration() {
+        let config = OwlConfig {
+            buffered_lines_limit: 0,
+            ..OwlConfig::default()
+        };
+        assert!(validate_config(&config).is_err());
+
+        let config = OwlConfig {
+            rotation: RotationPolicy::SizeMB(0),
+            ..OwlConfig::default()
+        };
+        assert!(validate_config(&config).is_err());
+
+        let config = OwlConfig {
+            rotation: RotationPolicy::SizeMB(u64::MAX),
+            ..OwlConfig::default()
+        };
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn cleanup_worker_stops_when_dropped() {
+        let worker =
+            CleanupWorker::start(std::env::temp_dir(), "cleanup-worker-test".to_string(), 1);
+        drop(worker);
+    }
+
+    #[test]
     fn temp_gzip_path_stays_next_to_destination() {
         let dest = std::path::Path::new("/tmp/app.1.log.gz");
         let tmp = unique_temp_gzip_path(dest);
@@ -1096,17 +1469,15 @@ mod tests {
 
     #[test]
     fn test_owl_rolling_file_writer_daily_rotation() {
-        let temp_dir = std::env::temp_dir().join(format!("owl-test-daily-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "owl-test-daily-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let file_name = "test_daily";
-        let mut writer = OwlRollingFileWriter::new(
-            &temp_dir,
-            file_name,
-            RotationPolicy::Daily,
-            None,
-            None,
-        );
+        let mut writer =
+            OwlRollingFileWriter::new(&temp_dir, file_name, RotationPolicy::Daily, None, None);
 
         // First write: creates test_daily.log
         std::io::Write::write_all(&mut writer, b"hello day 1\n").unwrap();
@@ -1122,14 +1493,16 @@ mod tests {
         // Next write triggers daily rotation
         std::io::Write::write_all(&mut writer, b"hello day 2\n").unwrap();
         std::io::Write::flush(&mut writer).unwrap();
-
-        // Wait a short duration for the background thread to complete the rotation
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(writer);
 
         // The old file should be rotated to test_daily.YYYY-MM-DD.log (using the yesterday's date)
         let expected_rotated_name = format!("{}.{}.log", file_name, yesterday.format("%Y-%m-%d"));
         let rotated_path = temp_dir.join(&expected_rotated_name);
-        assert!(rotated_path.exists(), "Expected rotated file to exist: {:?}", rotated_path);
+        assert!(
+            rotated_path.exists(),
+            "Expected rotated file to exist: {:?}",
+            rotated_path
+        );
 
         // The active file should still exist and contain the new logs
         assert!(active_path.exists());
@@ -1144,17 +1517,15 @@ mod tests {
 
     #[test]
     fn test_owl_rolling_file_writer_hourly_rotation() {
-        let temp_dir = std::env::temp_dir().join(format!("owl-test-hourly-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "owl-test-hourly-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let file_name = "test_hourly";
-        let mut writer = OwlRollingFileWriter::new(
-            &temp_dir,
-            file_name,
-            RotationPolicy::Hourly,
-            None,
-            None,
-        );
+        let mut writer =
+            OwlRollingFileWriter::new(&temp_dir, file_name, RotationPolicy::Hourly, None, None);
 
         std::io::Write::write_all(&mut writer, b"hello hour 1\n").unwrap();
         std::io::Write::flush(&mut writer).unwrap();
@@ -1171,13 +1542,20 @@ mod tests {
         // Next write triggers hourly rotation
         std::io::Write::write_all(&mut writer, b"hello hour 2\n").unwrap();
         std::io::Write::flush(&mut writer).unwrap();
+        drop(writer);
 
-        // Wait a short duration for the background thread to complete the rotation
-        std::thread::sleep(std::time::Duration::from_millis(150));
-
-        let expected_rotated_name = format!("{}.{}-{:02}.log", file_name, active_hour_val.0.format("%Y-%m-%d"), active_hour_val.1);
+        let expected_rotated_name = format!(
+            "{}.{}-{:02}.log",
+            file_name,
+            active_hour_val.0.format("%Y-%m-%d"),
+            active_hour_val.1
+        );
         let rotated_path = temp_dir.join(&expected_rotated_name);
-        assert!(rotated_path.exists(), "Expected rotated file to exist: {:?}", rotated_path);
+        assert!(
+            rotated_path.exists(),
+            "Expected rotated file to exist: {:?}",
+            rotated_path
+        );
 
         assert!(active_path.exists());
         let active_content = std::fs::read_to_string(&active_path).unwrap();
@@ -1185,6 +1563,46 @@ mod tests {
 
         let rotated_content = std::fs::read_to_string(&rotated_path).unwrap();
         assert_eq!(rotated_content, "hello hour 1\n");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn size_rotation_is_compressed_before_writer_drop_returns() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "owl-test-size-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut writer = OwlRollingFileWriter::new(
+            &temp_dir,
+            "test_size",
+            RotationPolicy::SizeMB(1),
+            None,
+            None,
+        );
+        std::io::Write::write_all(&mut writer, b"before rotation\n").unwrap();
+        std::io::Write::flush(&mut writer).unwrap();
+
+        // 避免写入 1 MiB 测试数据，直接模拟达到大小阈值。
+        writer.current_size = writer.max_size;
+        std::io::Write::write_all(&mut writer, b"after rotation\n").unwrap();
+        std::io::Write::flush(&mut writer).unwrap();
+        drop(writer);
+
+        let active = std::fs::read_to_string(temp_dir.join("test_size.log")).unwrap();
+        assert_eq!(active, "after rotation\n");
+
+        let rotated = temp_dir.join("test_size.1.log.gz");
+        assert!(
+            rotated.exists(),
+            "rotated file should be compressed before drop"
+        );
+        let mut decoder = flate2::read::GzDecoder::new(std::fs::File::open(rotated).unwrap());
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut content).unwrap();
+        assert_eq!(content, "before rotation\n");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -12,7 +12,7 @@
 - 🎨 **彩色输出** — 控制台日志带有颜色高亮，自动对齐
 - 🔄 **动态调整** — 运行时动态获取、更改日志级别与过滤规则，无需重启服务
 - 🔒 **敏感数据脱敏** — 内置敏感关键字检测（如 `password`, `token`），输出时自动脱敏为 `"[MASKED]"`
-- 🗜️ **后台异步压缩** — 支持大小轮转后，在后台线程自动把旧日志打包压缩为 `.gz` 文件
+- 🗜️ **可靠日志压缩** — 支持大小轮转后自动把旧日志打包压缩为 `.gz` 文件
 - 🧹 **保留期自动清理** — 支持设定日志保留天数，在独立后台线程中自动清理过期的历史日志文件
 - 🚨 **按级别分文件** — 可将达到指定级别（如 `ERROR`）的日志额外单独写入 `{file}.error.log`，便于运维定位
 - 🛰️ **OpenTelemetry/OTLP 导出** — 通过 `otlp` feature 将追踪 span 导出到 Jaeger / Tempo / OTel Collector（OTLP/HTTP，无需 Tokio 运行时）
@@ -21,6 +21,7 @@
 - 🔗 **上下文追踪** — 基于 `tracing::Span` 自动注入 `req_id`，支持同步/异步环境
 - 📊 **结构化 JSON** — 提供高度定制的扁平化 JSON 格式，便于 ELK / Datadog 等日志分析系统归档
 - 🧹 **优雅自动清理** — 利用 Rust 的 `Drop` 特征自动 flush，无需手动 `cleanup` 避免丢失日志
+- 📉 **丢失可观测** — 有损队列模式下可通过 `OwlGuard::dropped_lines()` 获取各输出通道的丢弃计数
 - 🔌 **生态兼容** — 自动桥接 `log` crate 生态，接管所有依赖库的日志
 
 ## 📦 安装
@@ -29,6 +30,8 @@
 [dependencies]
 owl-logger = "0.2.3"
 ```
+
+MSRV：Rust 1.88。
 
 ## 🚀 快速开始
 
@@ -90,6 +93,7 @@ let _guard = owl_logger::try_init_from_env().unwrap();
 ```
 
 支持 `OWL_LOG_LEVEL`、`OWL_LOG_FORMAT`、`OWL_LOG_DIR`、`OWL_LOG_FILE`。
+若设置了有效的 `RUST_LOG`，它会优先于 `OWL_LOG_LEVEL` 和 builder 的基础 level 生效。
 
 ### 2. 函数监控宏与异常升级
 
@@ -118,6 +122,8 @@ fn perform_action(user: &str) -> Result<String, String> {
 |:---|:---|
 | `level = "debug"` | 监控日志级别（默认 `info`） |
 | `skip(a, b)` | 将指定参数脱敏为 `[REDACTED]` |
+| `skip_all` | 不记录任何参数，适用于参数未实现 `Debug` 或整体敏感的函数 |
+| `skip_return` | 不记录返回值；同时关闭 Result::Err 自动升级，适用于返回值未实现 `Debug` 或敏感返回值 |
 | `slow_ms = 200` | 超过该毫秒数时以 WARN 级别标记 `SLOW` |
 | `span`（或 `span = true`） | 为函数体建立 `tracing::Span`，使函数**内部**的日志自动带上以函数名命名的上下文 |
 
@@ -133,7 +139,7 @@ fn handle(req_id: u64) {
 
 ### 3. 敏感数据安全脱敏 (PII Masking)
 
-在控制台和 JSON 格式输出中，只要日志字段名命中脱敏关键字列表，其具体数值将被自动脱敏过滤：
+在控制台和 JSON 格式输出中，只要日志字段名（大小写无关、包含匹配）命中脱敏关键字列表，其具体数值将被自动脱敏过滤：
 
 ```rust
 // 默认脱敏字段包括 password, token, secret, authorization, credit_card
@@ -174,7 +180,7 @@ fn main() {
 
 | 方法 | 默认值 | 说明 |
 |:---|:---|:---|
-| `.file_name(name)` | `"app"` | 日志文件名前缀 |
+| `.file_name(name)` | `"app"` | 日志文件名前缀（必须是单个文件名，不能包含路径） |
 | `.log_dir(dir)` | `"logs"` | 日志保存目录 |
 | `.level(level)` | `Info` | 最低日志过滤级别 |
 | `.language(lang)` | `En` | 系统提示词语言（En / Zh） |
@@ -188,7 +194,7 @@ fn main() {
 | `.otlp_endpoint(url)` | `None` | OTLP/HTTP 导出端点（需启用 `otlp` feature） |
 | `.otlp_service_name(name)` | `file_name` | OTLP 上报的 `service.name`（需启用 `otlp` feature） |
 | `.buffered_lines_limit(n)` | `120_000` | 异步非阻塞缓冲队列行数限制 |
-| `.lossy(bool)` | `true` | 队列写满时是否丢弃（`false` 会阻塞当前线程保证防丢失） |
+| `.lossy(bool)` | `true` | 队列写满时是否丢弃（`false` 会阻塞当前线程保证防丢失）；有损模式可通过 Guard 查询丢弃计数 |
 | `.console(bool)` | `true` | 是否启用控制台（Stderr）输出 |
 | `.file(bool)` | `true` | 是否启用文件输出 |
 | `.ansi(bool)` | `true` | 是否对控制台输出启用 ANSI 终端彩色着色 |
@@ -197,8 +203,8 @@ fn main() {
 | `.show_line_number(bool)` | `false` | 日志是否显示文件名与行号 |
 | `.time_format(format)` | `"%Y-%m-%d %H:%M:%S%.3f"` | 时间戳的 Chrono 格式化字符串 |
 | `.utc(bool)` | `false` | 是否强制使用 UTC 时区（默认本地时区） |
-| `.max_files(n)` | `None` | 最大历史保留文件数限制（按个数限制） |
-| `.catch_panic(bool)` | `true` | 是否自动接管 Panic 并附带 Backtrace 堆栈输出到日志中 |
+| `.max_files(n)` | `None` | 最大日志文件数（含当前活跃文件；`0` 表示不限） |
+| `.catch_panic(bool)` | `false` | 是否接管进程级 Panic hook 并附带 Backtrace；建议仅在应用入口显式启用 |
 
 环境变量初始化支持：
 
@@ -208,6 +214,16 @@ fn main() {
 | `OWL_LOG_FORMAT` | `pretty` / `compact` / `json` |
 | `OWL_LOG_DIR` | 日志保存目录 |
 | `OWL_LOG_FILE` | 日志文件名前缀 |
+| `RUST_LOG` | tracing 的完整过滤规则，优先于基础 level 配置 |
+
+可在服务运行期间采集有损队列的丢弃计数：
+
+```rust
+let dropped = _guard.dropped_lines();
+if dropped.total() > 0 {
+    eprintln!("dropped log output lines: {dropped:?}");
+}
+```
 
 ### 5. 按级别分文件（error.log）
 

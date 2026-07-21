@@ -25,9 +25,11 @@ const RESERVED_KEYS: &[&str] = &[
 ];
 
 fn is_sensitive_key(sensitive_keys: &[String], field_name: &str) -> bool {
-    sensitive_keys
-        .iter()
-        .any(|key| key.eq_ignore_ascii_case(field_name))
+    let normalized_field_name = field_name.to_ascii_lowercase();
+    sensitive_keys.iter().any(|key| {
+        let normalized_key = key.trim().to_ascii_lowercase();
+        !normalized_key.is_empty() && normalized_field_name.contains(&normalized_key)
+    })
 }
 
 /// 去除 `{:?}` 调试格式化产生的最外层引号（如 `"req-001"` -> `req-001`）
@@ -152,9 +154,31 @@ fn mask_string_if_sensitive(
     }
 }
 
+/// 插入用户提供的字段，同时保留已存在字段。
+///
+/// 事件字段优先以原名输出；保留键或同名字段会逐次添加下划线，而不是静默覆盖。
+fn insert_json_field(
+    log_obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: serde_json::Value,
+) {
+    let mut output_key = if RESERVED_KEYS.contains(&key) {
+        format!("_{key}")
+    } else {
+        key.to_string()
+    };
+
+    while log_obj.contains_key(&output_key) {
+        output_key.insert(0, '_');
+    }
+
+    log_obj.insert(output_key, value);
+}
+
 /// owl-logger 自定义格式化器（Pretty / 文本格式）
 pub struct OwlFormatter {
     pub(crate) language: Language,
+    pub(crate) compact: bool,
     pub(crate) show_target: bool,
     pub(crate) show_thread: bool,
     pub(crate) show_line_number: bool,
@@ -263,11 +287,19 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
-        // 时间 | 级别 |
+        // 时间 | 级别 |（Compact 格式使用空格分隔）
         self.write_timestamp(&mut writer)?;
-        self.write_separator(&mut writer)?;
+        if self.compact {
+            write!(writer, " ")?;
+        } else {
+            self.write_separator(&mut writer)?;
+        }
         self.write_level(&mut writer, event.metadata().level())?;
-        self.write_separator(&mut writer)?;
+        if self.compact {
+            write!(writer, " ")?;
+        } else {
+            self.write_separator(&mut writer)?;
+        }
 
         // Span 上下文信息（如 request req_id="req-001"）
         if let Some(scope) = ctx.event_scope() {
@@ -310,7 +342,11 @@ where
                 first = false;
             }
             if !first {
-                self.write_separator(&mut writer)?;
+                if self.compact {
+                    write!(writer, " ")?;
+                } else {
+                    self.write_separator(&mut writer)?;
+                }
             }
         }
 
@@ -322,7 +358,11 @@ where
             } else {
                 write!(writer, "{target}")?;
             }
-            self.write_separator(&mut writer)?;
+            if self.compact {
+                write!(writer, ": ")?;
+            } else {
+                self.write_separator(&mut writer)?;
+            }
         }
 
         // 线程信息
@@ -334,7 +374,11 @@ where
             } else {
                 write!(writer, "{thread_name}")?;
             }
-            self.write_separator(&mut writer)?;
+            if self.compact {
+                write!(writer, " ")?;
+            } else {
+                self.write_separator(&mut writer)?;
+            }
         }
 
         // 行号
@@ -346,7 +390,11 @@ where
                     } else {
                         write!(writer, "{file}:{line}")?;
                     }
-                    self.write_separator(&mut writer)?;
+                    if self.compact {
+                        write!(writer, " ")?;
+                    } else {
+                        self.write_separator(&mut writer)?;
+                    }
                 }
             }
         }
@@ -560,7 +608,12 @@ where
             );
         }
 
-        // 7. Span 链上下文信息合并到顶层（包含 req_id 等）
+        // 7. 事件自定义字段优先平铺；冲突时保留全部来源而不是覆盖。
+        for (key, value) in fields_map {
+            insert_json_field(&mut log_obj, &key, value);
+        }
+
+        // 8. Span 链上下文信息合并到顶层（包含 req_id 等）
         if let Some(scope) = ctx.event_scope() {
             for span in scope.from_root() {
                 let ext = span.extensions();
@@ -571,38 +624,19 @@ where
                         } else {
                             v.clone()
                         };
-                        let key = if RESERVED_KEYS.contains(&k.as_str()) {
-                            format!("_{k}")
-                        } else {
-                            k.clone()
-                        };
-                        log_obj.insert(key, value);
+                        insert_json_field(&mut log_obj, k, value);
                     }
                 }
             }
         }
 
-        // 8. 全局字段合并到顶层
+        // 9. 全局字段合并到顶层
         for (k, v) in &self.global_fields {
-            let key = if RESERVED_KEYS.contains(&k.as_str()) {
-                format!("_{k}")
-            } else {
-                k.clone()
-            };
-            log_obj.insert(
-                key,
+            insert_json_field(
+                &mut log_obj,
+                k,
                 mask_string_if_sensitive(&self.sensitive_keys, k, v.clone()),
             );
-        }
-
-        // 9. 如果还有其他自定义 fields，平铺在顶层
-        for (k, v) in fields_map {
-            let key = if RESERVED_KEYS.contains(&k.as_str()) {
-                format!("_{k}")
-            } else {
-                k
-            };
-            log_obj.insert(key, v);
         }
 
         if let Ok(serialized) = serde_json::to_string(&log_obj) {
@@ -619,6 +653,7 @@ pub(crate) fn file_formatter(
 ) -> OwlFormatter {
     OwlFormatter {
         language,
+        compact: false,
         show_target: config.show_target,
         show_thread: config.show_thread,
         show_line_number: config.show_line_number,
@@ -637,6 +672,48 @@ pub(crate) fn console_formatter(
 ) -> OwlFormatter {
     OwlFormatter {
         language,
+        compact: false,
+        show_target: config.show_target,
+        show_thread: config.show_thread,
+        show_line_number: config.show_line_number,
+        enable_ansi: config.enable_ansi,
+        time_format: config.time_format.clone(),
+        use_utc: config.use_utc,
+        global_fields: config.global_fields.clone(),
+        sensitive_keys: config.sensitive_keys.clone(),
+    }
+}
+
+/// 用于文件输出的无色 Compact 格式化器。
+///
+/// Compact 也必须经过 owl-logger 的字段访问器，保证脱敏和全局字段与 Pretty/JSON
+/// 输出保持一致，不能回退到 tracing-subscriber 的默认格式化器。
+pub(crate) fn file_compact_formatter(
+    language: Language,
+    config: &crate::config::OwlConfig,
+) -> OwlFormatter {
+    OwlFormatter {
+        language,
+        compact: true,
+        show_target: config.show_target,
+        show_thread: config.show_thread,
+        show_line_number: config.show_line_number,
+        enable_ansi: false,
+        time_format: config.time_format.clone(),
+        use_utc: config.use_utc,
+        global_fields: config.global_fields.clone(),
+        sensitive_keys: config.sensitive_keys.clone(),
+    }
+}
+
+/// 用于控制台输出的 Compact 格式化器。
+pub(crate) fn console_compact_formatter(
+    language: Language,
+    config: &crate::config::OwlConfig,
+) -> OwlFormatter {
+    OwlFormatter {
+        language,
+        compact: true,
         show_target: config.show_target,
         show_thread: config.show_thread,
         show_line_number: config.show_line_number,
@@ -657,8 +734,11 @@ mod tests {
         let keys = vec!["token".to_string(), "api_key".to_string()];
 
         assert!(is_sensitive_key(&keys, "Token"));
+        assert!(is_sensitive_key(&keys, "access_token"));
+        assert!(is_sensitive_key(&keys, "apiSecretToken"));
         assert!(is_sensitive_key(&keys, "API_KEY"));
         assert!(!is_sensitive_key(&keys, "user"));
+        assert!(!is_sensitive_key(&["".to_string()], "user"));
     }
 
     #[test]

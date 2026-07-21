@@ -1,4 +1,5 @@
 use proc_macro::TokenStream;
+use proc_macro_crate::{crate_name, FoundCrate};
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
@@ -15,6 +16,8 @@ use syn::{
 ///
 /// - `level = "debug"`：监控日志级别（默认 `info`）。
 /// - `skip(a, b)`：脱敏指定参数，输出为 `[REDACTED]`。
+/// - `skip_all`：不记录任何参数，避免参数必须实现 `Debug`。
+/// - `skip_return`：不记录返回值，也不进行 Result::Err 自动升级。
 /// - `slow_ms = 200`：超过该毫秒数时以 WARN 级别标记 `SLOW`。
 /// - `span`（或 `span = true`）：为函数体建立一个 `tracing::Span`，
 ///   使函数内部的所有日志自动带上以函数名命名的上下文。
@@ -39,18 +42,20 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let return_type = &input.sig.output;
     let is_async = input.sig.asyncness.is_some();
     let use_span = args.span;
+    let logger_crate = owl_logger_crate_path();
 
     // 收集参数名和格式化
-    let param_formats = build_param_formats(&input.sig.inputs, &args.skip);
+    let param_formats = if args.skip_all {
+        quote! { String::new() }
+    } else {
+        build_param_formats(&input.sig.inputs, &args.skip)
+    };
 
-    // 构建日志级别的 token（全部走 owl_logger re-export 路径，避免用户必须显式依赖 tracing）
+    // 构建日志级别的 token（全部走 owl-logger re-export 路径，避免用户必须显式依赖 tracing）
     let level_str = args.level.unwrap_or_else(|| "info".to_string());
-    let level_token = match level_str.as_str() {
-        "trace" => quote! { owl_logger::__private::tracing::Level::TRACE },
-        "debug" => quote! { owl_logger::__private::tracing::Level::DEBUG },
-        "warn" => quote! { owl_logger::__private::tracing::Level::WARN },
-        "error" => quote! { owl_logger::__private::tracing::Level::ERROR },
-        _ => quote! { owl_logger::__private::tracing::Level::INFO },
+    let level_token = match monitor_level_token(&level_str, &logger_crate) {
+        Ok(level) => level,
+        Err(error) => return error.into_compile_error().into(),
     };
     let slow_check = if let Some(ms) = args.slow_ms {
         quote! { __owl_elapsed >= std::time::Duration::from_millis(#ms) }
@@ -60,23 +65,53 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let has_return = !matches!(return_type, ReturnType::Default);
 
-    let exit_log = if has_return {
+    let exit_log = if has_return && args.skip_return {
         quote! {
-            let __owl_lang = owl_logger::__private::get_language();
-            let __owl_exiting = owl_logger::__private::I18n::exiting_function(__owl_lang);
-            let __owl_elapsed_label = owl_logger::__private::I18n::elapsed(__owl_lang);
-            let __owl_returned_label = owl_logger::__private::I18n::returned(__owl_lang);
+            let __owl_lang = #logger_crate::__private::get_language();
+            let __owl_exiting = #logger_crate::__private::I18n::exiting_function(__owl_lang);
+            let __owl_elapsed_label = #logger_crate::__private::I18n::elapsed(__owl_lang);
+
+            if __owl_slow {
+                #logger_crate::__private::tracing::event!(
+                    target: "monitor",
+                    #logger_crate::__private::tracing::Level::WARN,
+                    "{} {}({}) — {} {:.2?} — SLOW — return value omitted",
+                    __owl_exiting,
+                    #fn_name_str,
+                    __owl_params,
+                    __owl_elapsed_label,
+                    __owl_elapsed
+                );
+            } else {
+                #logger_crate::__private::tracing::event!(
+                    target: "monitor",
+                    #level_token,
+                    "{} {}({}) — {} {:.2?} — return value omitted",
+                    __owl_exiting,
+                    #fn_name_str,
+                    __owl_params,
+                    __owl_elapsed_label,
+                    __owl_elapsed
+                );
+            }
+        }
+    } else if has_return {
+        quote! {
+            let __owl_lang = #logger_crate::__private::get_language();
+            let __owl_exiting = #logger_crate::__private::I18n::exiting_function(__owl_lang);
+            let __owl_elapsed_label = #logger_crate::__private::I18n::elapsed(__owl_lang);
+            let __owl_returned_label = #logger_crate::__private::I18n::returned(__owl_lang);
 
             // 使用 autoref 特化在运行期动态判定是否为 Err 并自动升级日志级别
             #[allow(unused_imports)]
-            use owl_logger::__private::{OwlLowPriority, OwlHighPriority};
-            let __owl_result_info = (&owl_logger::__private::OwlWrap(&__owl_result)).owl_inspect();
+            use #logger_crate::__private::{OwlHighPriority, OwlLowPriority};
+            let __owl_result_info = (&#logger_crate::__private::OwlWrap(&__owl_result)).owl_inspect();
 
             if __owl_result_info.is_err {
                 let __owl_error_detail = __owl_result_info.error_msg.as_deref().unwrap_or("unknown error");
-                owl_logger::__private::tracing::event!(
+                #logger_crate::__private::tracing::event!(
                     target: "monitor",
-                    owl_logger::__private::tracing::Level::ERROR,
+                    #logger_crate::__private::tracing::Level::ERROR,
                     "{} {}({}) — {} {:.2?} — ERROR: {}",
                     __owl_exiting,
                     #fn_name_str,
@@ -86,9 +121,9 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __owl_error_detail
                 );
             } else if __owl_slow {
-                owl_logger::__private::tracing::event!(
+                #logger_crate::__private::tracing::event!(
                     target: "monitor",
-                    owl_logger::__private::tracing::Level::WARN,
+                    #logger_crate::__private::tracing::Level::WARN,
                     "{} {}({}) — {} {:.2?} — SLOW — {} {:?}",
                     __owl_exiting,
                     #fn_name_str,
@@ -99,7 +134,7 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __owl_result
                 );
             } else {
-                owl_logger::__private::tracing::event!(
+                #logger_crate::__private::tracing::event!(
                     target: "monitor",
                     #level_token,
                     "{} {}({}) — {} {:.2?} — {} {:?}",
@@ -115,13 +150,13 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         quote! {
-            let __owl_lang = owl_logger::__private::get_language();
-            let __owl_exiting = owl_logger::__private::I18n::exiting_function(__owl_lang);
-            let __owl_elapsed_label = owl_logger::__private::I18n::elapsed(__owl_lang);
+            let __owl_lang = #logger_crate::__private::get_language();
+            let __owl_exiting = #logger_crate::__private::I18n::exiting_function(__owl_lang);
+            let __owl_elapsed_label = #logger_crate::__private::I18n::elapsed(__owl_lang);
             if __owl_slow {
-                owl_logger::__private::tracing::event!(
+                #logger_crate::__private::tracing::event!(
                     target: "monitor",
-                    owl_logger::__private::tracing::Level::WARN,
+                    #logger_crate::__private::tracing::Level::WARN,
                     "{} {}({}) — {} {:.2?} — SLOW",
                     __owl_exiting,
                     #fn_name_str,
@@ -130,7 +165,7 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __owl_elapsed
                 );
             } else {
-                owl_logger::__private::tracing::event!(
+                #logger_crate::__private::tracing::event!(
                     target: "monitor",
                     #level_token,
                     "{} {}({}) — {} {:.2?}",
@@ -145,9 +180,9 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let entering_log = quote! {
-        let __owl_lang = owl_logger::__private::get_language();
-        let __owl_entering = owl_logger::__private::I18n::entering_function(__owl_lang);
-        owl_logger::__private::tracing::event!(
+        let __owl_lang = #logger_crate::__private::get_language();
+        let __owl_entering = #logger_crate::__private::I18n::entering_function(__owl_lang);
+        #logger_crate::__private::tracing::event!(
             target: "monitor",
             #level_token,
             "{} {}({})",
@@ -168,7 +203,7 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
         if use_span {
             quote! {
                 {
-                    use owl_logger::__private::tracing::Instrument as _;
+                    use #logger_crate::__private::tracing::Instrument as _;
                     async move { #body }.instrument(__owl_span).await
                 }
             }
@@ -195,7 +230,7 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
     // 可选：为函数体建立 span（即使监控 enter/exit 日志被过滤，span 仍可用于内部日志上下文）
     let span_def = if use_span {
         quote! {
-            let __owl_span = owl_logger::__private::tracing::span!(
+            let __owl_span = #logger_crate::__private::tracing::span!(
                 target: "monitor",
                 #level_token,
                 #fn_name_str
@@ -206,16 +241,16 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let mut should_log_conditions = vec![
-        quote! { owl_logger::__private::tracing::enabled!(target: "monitor", #level_token) }
+        quote! { #logger_crate::__private::tracing::enabled!(target: "monitor", #level_token) },
     ];
     if args.slow_ms.is_some() {
         should_log_conditions.push(quote! {
-            owl_logger::__private::tracing::enabled!(target: "monitor", owl_logger::__private::tracing::Level::WARN)
+            #logger_crate::__private::tracing::enabled!(target: "monitor", #logger_crate::__private::tracing::Level::WARN)
         });
     }
-    if has_return {
+    if has_return && !args.skip_return {
         should_log_conditions.push(quote! {
-            owl_logger::__private::tracing::enabled!(target: "monitor", owl_logger::__private::tracing::Level::ERROR)
+            #logger_crate::__private::tracing::enabled!(target: "monitor", #logger_crate::__private::tracing::Level::ERROR)
         });
     }
     let should_log_expr = quote! { #(#should_log_conditions)||* };
@@ -249,10 +284,42 @@ pub fn monitor(attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+fn owl_logger_crate_path() -> proc_macro2::TokenStream {
+    match crate_name("owl-logger") {
+        // 示例目标与库本体共享同一个 Cargo package，但示例中的 crate 指向二进制
+        // 目标而非库。库根通过 extern crate self 别名保证该路径在两种情形均有效。
+        Ok(FoundCrate::Itself) => quote! { ::owl_logger },
+        Ok(FoundCrate::Name(name)) => {
+            let ident = Ident::new(&name.replace('-', "_"), proc_macro2::Span::call_site());
+            quote! { ::#ident }
+        }
+        Err(_) => quote! { ::owl_logger },
+    }
+}
+
+fn monitor_level_token(
+    level: &str,
+    logger_crate: &proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    match level {
+        "trace" => Ok(quote! { #logger_crate::__private::tracing::Level::TRACE }),
+        "debug" => Ok(quote! { #logger_crate::__private::tracing::Level::DEBUG }),
+        "info" => Ok(quote! { #logger_crate::__private::tracing::Level::INFO }),
+        "warn" => Ok(quote! { #logger_crate::__private::tracing::Level::WARN }),
+        "error" => Ok(quote! { #logger_crate::__private::tracing::Level::ERROR }),
+        _ => Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "level must be one of: trace, debug, info, warn, error",
+        )),
+    }
+}
+
 /// 过程宏属性参数
 struct MonitorArgs {
     level: Option<String>,
     skip: Vec<String>,
+    skip_all: bool,
+    skip_return: bool,
     slow_ms: Option<u64>,
     span: bool,
 }
@@ -261,6 +328,8 @@ impl Parse for MonitorArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut level = None;
         let mut skip = Vec::new();
+        let mut skip_all = false;
+        let mut skip_return = false;
         let mut slow_ms = None;
         let mut span = false;
 
@@ -268,6 +337,8 @@ impl Parse for MonitorArgs {
             return Ok(MonitorArgs {
                 level,
                 skip,
+                skip_all,
+                skip_return,
                 slow_ms,
                 span,
             });
@@ -319,7 +390,7 @@ impl Parse for MonitorArgs {
                     } else {
                         return Err(syn::Error::new_spanned(
                             path,
-                            "unknown argument, supported: level, skip, slow_ms, span",
+                            "unknown argument, supported: level, skip, skip_all, skip_return, slow_ms, span",
                         ));
                     }
                 }
@@ -335,17 +406,21 @@ impl Parse for MonitorArgs {
                     } else {
                         return Err(syn::Error::new_spanned(
                             path,
-                            "unknown argument, supported: level, skip, slow_ms, span",
+                            "unknown argument, supported: level, skip, skip_all, skip_return, slow_ms, span",
                         ));
                     }
                 }
                 Meta::Path(path) => {
                     if path.is_ident("span") {
                         span = true;
+                    } else if path.is_ident("skip_all") {
+                        skip_all = true;
+                    } else if path.is_ident("skip_return") {
+                        skip_return = true;
                     } else {
                         return Err(syn::Error::new_spanned(
                             path,
-                            "unknown argument, supported: level, skip, slow_ms, span",
+                            "unknown argument, supported: level, skip, skip_all, skip_return, slow_ms, span",
                         ));
                     }
                 }
@@ -355,6 +430,8 @@ impl Parse for MonitorArgs {
         Ok(MonitorArgs {
             level,
             skip,
+            skip_all,
+            skip_return,
             slow_ms,
             span,
         })
@@ -393,5 +470,18 @@ fn build_param_formats(
         quote! {
             [#(#param_strings),*].join(", ")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{monitor_level_token, owl_logger_crate_path};
+
+    #[test]
+    fn monitor_level_is_validated_at_macro_expansion_time() {
+        let logger_crate = owl_logger_crate_path();
+        assert!(monitor_level_token("info", &logger_crate).is_ok());
+        assert!(monitor_level_token("warn", &logger_crate).is_ok());
+        assert!(monitor_level_token("verbose", &logger_crate).is_err());
     }
 }

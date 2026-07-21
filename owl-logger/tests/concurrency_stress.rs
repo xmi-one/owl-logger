@@ -17,17 +17,21 @@ fn unique_temp_dir(tag: &str) -> PathBuf {
 // 被 monitor 监控的测试函数，带有可能发生级别升级的 Result 返回值
 #[monitor(span, slow_ms = 100)]
 fn monitored_work(worker_id: usize, task_id: usize) -> Result<usize, String> {
-    if task_id % 50 == 0 {
+    if task_id.is_multiple_of(50) {
         // 模拟偶尔出现的错误以触发 ERROR 级别日志自动升级
         return Err(format!("Worker {} failed on task {}", worker_id, task_id));
     }
-    
+
     if task_id % 100 == 1 {
         // 模拟偶尔慢速的任务以触发 SLOW (WARN) 级别日志升级
         thread::sleep(std::time::Duration::from_millis(120));
     }
 
-    tracing::debug!(worker = worker_id, task = task_id, "Monitored task execution progress");
+    tracing::debug!(
+        worker = worker_id,
+        task = task_id,
+        "Monitored task execution progress"
+    );
     Ok(task_id)
 }
 
@@ -57,14 +61,19 @@ fn test_logger_under_heavy_concurrency() {
             let handle = thread::spawn(move || {
                 for task_id in 0..num_tasks_per_thread {
                     // 模拟同步上下文追踪
-                    let _ctx = owl_logger::context::with_request_id(&format!("req-{}-{}", t_id, task_id));
-                    
+                    let _ctx =
+                        owl_logger::context::with_request_id(&format!("req-{}-{}", t_id, task_id));
+
                     // 执行监控函数
                     let _ = monitored_work(t_id, task_id);
-                    
+
                     // 混合常规并发日志
-                    if task_id % 10 == 0 {
-                        tracing::info!(worker = t_id, task = task_id, "Normal concurrency log item");
+                    if task_id.is_multiple_of(10) {
+                        tracing::info!(
+                            worker = t_id,
+                            task = task_id,
+                            "Normal concurrency log item"
+                        );
                     }
                 }
             });
@@ -82,7 +91,10 @@ fn test_logger_under_heavy_concurrency() {
     let error_log_path = dir.join("stress_app.error.log");
 
     assert!(main_log_path.exists(), "Main log file must be created");
-    assert!(error_log_path.exists(), "Error separation log file must be created");
+    assert!(
+        error_log_path.exists(),
+        "Error separation log file must be created"
+    );
 
     let main_content = std::fs::read_to_string(&main_log_path).expect("Read main log failed");
     let error_content = std::fs::read_to_string(&error_log_path).expect("Read error log failed");
@@ -93,9 +105,9 @@ fn test_logger_under_heavy_concurrency() {
 
     // 每一行都应当是合法的 JSON 格式
     for line in &main_lines {
-        let val: serde_json::Value = serde_json::from_str(line)
-            .expect("Each line in main log must be valid JSON");
-        
+        let val: serde_json::Value =
+            serde_json::from_str(line).expect("Each line in main log must be valid JSON");
+
         // 验证请求上下文 ID 成功贯通
         if let Some(req_id) = val.get("req_id") {
             assert!(req_id.as_str().unwrap().starts_with("req-"));
@@ -103,17 +115,17 @@ fn test_logger_under_heavy_concurrency() {
     }
 
     for line in &error_lines {
-        let val: serde_json::Value = serde_json::from_str(line)
-            .expect("Each line in error log must be valid JSON");
+        let val: serde_json::Value =
+            serde_json::from_str(line).expect("Each line in error log must be valid JSON");
         // 验证分流出的日志确实全为 ERROR 级别
         assert_eq!(val["level"], "ERROR");
     }
 
     // 主日志行数应相当可观且不应为 0
     assert!(main_lines.len() > 1000, "Should contain thousands of logs");
-    
+
     // 错误日志中应且仅包含由 task_id % 50 == 0 带来的错误
-    assert!(error_lines.len() > 0, "Should capture worker error logs");
+    assert!(!error_lines.is_empty(), "Should capture worker error logs");
 
     // 清理测试目录
     let _ = std::fs::remove_dir_all(&dir);
