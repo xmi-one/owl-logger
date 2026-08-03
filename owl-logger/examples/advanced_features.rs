@@ -8,12 +8,12 @@ use owl_logger::monitor;
 
 #[monitor]
 fn perform_success_action(user: &str) -> Result<String, String> {
-    Ok(format!("Welcome, {}!", user))
+    Ok(format!("Welcome, {user}!"))
 }
 
 #[monitor]
 fn perform_error_action(user: &str) -> Result<String, String> {
-    Err(format!("Access denied for user: {}", user))
+    Err(format!("Access denied for user: {user}"))
 }
 
 fn main() {
@@ -23,7 +23,7 @@ fn main() {
         _ => owl_logger::OutputFormat::Pretty,
     };
 
-    println!(">>> 正在以 {:?} 格式初始化 owl-logger ...\n", format);
+    println!(">>> 正在以 {format:?} 格式初始化 owl-logger ...\n");
 
     // 1. 初始化带多种高级配置的日志系统
     let _guard = owl_logger::builder()

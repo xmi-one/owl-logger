@@ -106,7 +106,7 @@ impl<'a> tracing::field::Visit for SpanFieldVisitor<'a> {
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        let cleaned = strip_debug_quotes(format!("{:?}", value));
+        let cleaned = strip_debug_quotes(format!("{value:?}"));
         self.push(field.name(), serde_json::Value::String(cleaned));
     }
 }
@@ -194,7 +194,7 @@ impl OwlFormatter {
                 Level::ERROR => write!(w, "{}", name.red().bold()),
             }
         } else {
-            write!(w, "{}", name)
+            write!(w, "{name}")
         }
     }
 
@@ -208,7 +208,7 @@ impl OwlFormatter {
         if self.enable_ansi {
             write!(w, "{}", ts.dimmed())
         } else {
-            write!(w, "{}", ts)
+            write!(w, "{ts}")
         }
     }
 
@@ -247,14 +247,14 @@ impl<'a> tracing::field::Visit for PrettyVisitor<'a> {
         use std::fmt::Write as _;
         let name = field.name();
         if name == "message" {
-            let val_str = format!("{:?}", value);
+            let val_str = format!("{value:?}");
             *self.message = escape_log_text(&strip_debug_quotes(val_str)).to_string();
             return;
         }
         if !self.fields.is_empty() {
             self.fields.push(' ');
         }
-        let value = format!("{:?}", value);
+        let value = format!("{value:?}");
         let _ = write!(self.fields, "{}={}", name, escape_log_text(&value));
     }
 }
@@ -326,7 +326,7 @@ where
                         }
 
                         if !span_fields.is_empty() {
-                            write!(writer, "{{{}}}", span_fields)?;
+                            write!(writer, "{{{span_fields}}}")?;
                         }
                     }
                 }
@@ -404,7 +404,7 @@ where
                 if fields_str.is_empty() {
                     message
                 } else {
-                    format!("{} {}", message, fields_str)
+                    format!("{message} {fields_str}")
                 }
             } else if fields_str.is_empty() {
                 format!("{} {}", message, self.global_fields)
@@ -416,13 +416,13 @@ where
             match *level {
                 Level::ERROR => write!(writer, "{}", full_msg.red().bold())?,
                 Level::WARN => write!(writer, "{}", full_msg.yellow())?,
-                Level::INFO => write!(writer, "{}", full_msg)?,
+                Level::INFO => write!(writer, "{full_msg}")?,
                 Level::DEBUG | Level::TRACE => write!(writer, "{}", full_msg.dimmed())?,
             }
         } else if fields_str.is_empty() && self.global_fields.is_empty() {
-            write!(writer, "{}", message)?;
+            write!(writer, "{message}")?;
         } else if self.global_fields.is_empty() {
-            write!(writer, "{} {}", message, fields_str)?;
+            write!(writer, "{message} {fields_str}")?;
         } else if fields_str.is_empty() {
             write!(writer, "{} {}", message, self.global_fields)?;
         } else {
@@ -489,7 +489,7 @@ impl<'a> tracing::field::Visit for JsonVisitor<'a> {
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let name = field.name();
-        let val_str = format!("{:?}", value);
+        let val_str = format!("{value:?}");
         let cleaned = if val_str.starts_with('"') && val_str.ends_with('"') && val_str.len() >= 2 {
             val_str[1..val_str.len() - 1].to_string()
         } else {

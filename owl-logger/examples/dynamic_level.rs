@@ -26,5 +26,5 @@ fn main() {
 
     // 4. 查询当前过滤规则
     let current_filter = owl_logger::get_filter().unwrap();
-    println!("\n>>> 当前过滤规则为: {}", current_filter);
+    println!("\n>>> 当前过滤规则为: {current_filter}");
 }

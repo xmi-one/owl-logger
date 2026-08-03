@@ -250,7 +250,7 @@ pub mod __private {
                 Err(e) => OwlResultInfo {
                     is_err: true,
                     level_override: Some(tracing::Level::ERROR),
-                    error_msg: Some(format!("{:?}", e)),
+                    error_msg: Some(format!("{e:?}")),
                 },
             }
         }

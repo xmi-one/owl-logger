@@ -464,7 +464,7 @@ impl OwlLoggerBuilder {
                 };
 
                 let backtrace = std::backtrace::Backtrace::capture();
-                let backtrace_str = format!("{}", backtrace);
+                let backtrace_str = format!("{backtrace}");
 
                 if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
                     tracing::error!(
@@ -1022,8 +1022,7 @@ fn unique_staging_path(log_dir: &std::path::Path, file_name: &str) -> std::path:
         .unwrap_or_default();
     let thread_id = format!("{:?}", std::thread::current().id());
     log_dir.join(format!(
-        "{}.rotate-staging.{}.{}.log",
-        file_name, nanos, thread_id
+        "{file_name}.rotate-staging.{nanos}.{thread_id}.log"
     ))
 }
 
@@ -1119,13 +1118,13 @@ fn matches_suffix(mut s: &str) -> bool {
 /// 精确判定文件名是否是由特定前缀的日志组件生成的（包括其轮转产生的备份文件，无递归）
 fn is_log_file_for_prefix_non_recursive(filename: &str, file_name: &str) -> bool {
     // 1. 完全匹配 {file_name}.log 或 {file_name}.log.gz
-    if filename == format!("{}.log", file_name) || filename == format!("{}.log.gz", file_name) {
+    if filename == format!("{file_name}.log") || filename == format!("{file_name}.log.gz") {
         return true;
     }
 
     // 2. 匹配旧格式 {file_name}.log.YYYY-MM-DD 或
     // {file_name}.log.YYYY-MM-DD-HH（Daily/Hourly 轮转文件）。
-    let log_dot = format!("{}.log.", file_name);
+    let log_dot = format!("{file_name}.log.");
     if filename
         .strip_prefix(&log_dot)
         .is_some_and(matches_legacy_time_rotation_suffix)
@@ -1137,7 +1136,7 @@ fn is_log_file_for_prefix_non_recursive(filename: &str, file_name: &str) -> bool
     // 或者是 {file_name}.YYYY-MM-DD-HH.log / .log.gz
     // 或者是 {file_name}.index.log / .log.gz (Size 轮转文件)
     // 或者是带有重复序号的 {file_name}.YYYY-MM-DD.index.log / .log.gz
-    let dot_prefix = format!("{}.", file_name);
+    let dot_prefix = format!("{file_name}.");
     if filename.starts_with(&dot_prefix) {
         let remaining = &filename[dot_prefix.len()..];
         if let Some(first_dot) = remaining.find('.') {
@@ -1170,7 +1169,7 @@ fn is_log_file_for_prefix(filename: &str, file_name: &str) -> bool {
 
     // 检查各日志级别的独立文件分支（如 app.error.log 等）
     for level in &["error", "warn", "info", "debug", "trace"] {
-        let level_prefix = format!("{}.{}", file_name, level);
+        let level_prefix = format!("{file_name}.{level}");
         if is_log_file_for_prefix_non_recursive(filename, &level_prefix) {
             return true;
         }
@@ -1232,13 +1231,13 @@ fn cleanup_old_logs(log_dir: &std::path::Path, file_name: &str, retention_days: 
     let max_age = std::time::Duration::from_secs(retention_days as u64 * 24 * 60 * 60);
 
     // 当前活跃写入的文件，绝对不被清理
-    let log_exact = format!("{}.log", file_name);
+    let log_exact = format!("{file_name}.log");
     let active_error_log_prefixes = [
-        format!("{}.error.log", file_name),
-        format!("{}.warn.log", file_name),
-        format!("{}.info.log", file_name),
-        format!("{}.debug.log", file_name),
-        format!("{}.trace.log", file_name),
+        format!("{file_name}.error.log"),
+        format!("{file_name}.warn.log"),
+        format!("{file_name}.info.log"),
+        format!("{file_name}.debug.log"),
+        format!("{file_name}.trace.log"),
     ];
 
     if let Ok(entries) = std::fs::read_dir(log_dir) {
@@ -1482,8 +1481,7 @@ mod tests {
         let rotated_path = temp_dir.join(&expected_rotated_name);
         assert!(
             rotated_path.exists(),
-            "Expected rotated file to exist: {:?}",
-            rotated_path
+            "Expected rotated file to exist: {rotated_path:?}"
         );
 
         // The active file should still exist and contain the new logs
@@ -1535,8 +1533,7 @@ mod tests {
         let rotated_path = temp_dir.join(&expected_rotated_name);
         assert!(
             rotated_path.exists(),
-            "Expected rotated file to exist: {:?}",
-            rotated_path
+            "Expected rotated file to exist: {rotated_path:?}"
         );
 
         assert!(active_path.exists());

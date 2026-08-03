@@ -16,7 +16,7 @@ fn main() {
         _ => OutputFormat::Pretty,
     };
 
-    println!(">>> 正在以 {:?} 格式初始化 owl-logger ...\n", format);
+    println!(">>> 正在以 {format:?} 格式初始化 owl-logger ...\n");
 
     let _guard = owl_logger::builder()
         .format(format)

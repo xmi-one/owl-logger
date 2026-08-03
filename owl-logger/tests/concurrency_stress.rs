@@ -19,7 +19,7 @@ fn unique_temp_dir(tag: &str) -> PathBuf {
 fn monitored_work(worker_id: usize, task_id: usize) -> Result<usize, String> {
     if task_id.is_multiple_of(50) {
         // 模拟偶尔出现的错误以触发 ERROR 级别日志自动升级
-        return Err(format!("Worker {} failed on task {}", worker_id, task_id));
+        return Err(format!("Worker {worker_id} failed on task {task_id}"));
     }
 
     if task_id % 100 == 1 {
@@ -62,7 +62,7 @@ fn test_logger_under_heavy_concurrency() {
                 for task_id in 0..num_tasks_per_thread {
                     // 模拟同步上下文追踪
                     let _ctx =
-                        owl_logger::context::with_request_id(&format!("req-{}-{}", t_id, task_id));
+                        owl_logger::context::with_request_id(&format!("req-{t_id}-{task_id}"));
 
                     // 执行监控函数
                     let _ = monitored_work(t_id, task_id);
