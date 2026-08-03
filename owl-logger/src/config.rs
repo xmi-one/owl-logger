@@ -118,8 +118,6 @@ pub struct OwlConfig {
     pub catch_panic: bool,
     /// 全局常量字段（会自动附加到每条日志）
     pub global_fields: std::collections::HashMap<String, String>,
-    /// 敏感字段名列表（包含的字段内容会被自动脱敏为 [MASKED]）
-    pub sensitive_keys: Vec<String>,
     /// 日志保留天数（超过此天数的日志文件会被自动清理）
     pub retention_days: Option<usize>,
     /// 异步非阻塞队列的容量限制
@@ -161,13 +159,6 @@ impl Default for OwlConfig {
             max_files: None,
             catch_panic: false,
             global_fields: std::collections::HashMap::new(),
-            sensitive_keys: vec![
-                "password".to_string(),
-                "token".to_string(),
-                "secret".to_string(),
-                "authorization".to_string(),
-                "credit_card".to_string(),
-            ],
             retention_days: Some(7),
             buffered_lines_limit: 120_000,
             lossy: true,

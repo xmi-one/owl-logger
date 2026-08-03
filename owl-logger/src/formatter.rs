@@ -12,8 +12,6 @@ use tracing_subscriber::registry::LookupSpan;
 use crate::config::Language;
 use crate::i18n::I18n;
 
-const MASKED: &str = "[MASKED]";
-
 const RESERVED_KEYS: &[&str] = &[
     "timestamp",
     "level",
@@ -24,14 +22,6 @@ const RESERVED_KEYS: &[&str] = &[
     "line",
 ];
 
-fn is_sensitive_key(sensitive_keys: &[String], field_name: &str) -> bool {
-    let normalized_field_name = field_name.to_ascii_lowercase();
-    sensitive_keys.iter().any(|key| {
-        let normalized_key = key.trim().to_ascii_lowercase();
-        !normalized_key.is_empty() && normalized_field_name.contains(&normalized_key)
-    })
-}
-
 /// 去除 `{:?}` 调试格式化产生的最外层引号（如 `"req-001"` -> `req-001`）
 fn strip_debug_quotes(s: String) -> String {
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
@@ -39,6 +29,28 @@ fn strip_debug_quotes(s: String) -> String {
     } else {
         s
     }
+}
+
+/// Escapes control characters, quotes, and backslashes before including user data in a
+/// single-line text log. JSON output is serialized separately and does not use this helper.
+fn escape_log_text(value: &str) -> std::str::EscapeDebug<'_> {
+    value.escape_debug()
+}
+
+fn format_global_fields(global_fields: &HashMap<String, String>) -> String {
+    use std::fmt::Write as _;
+
+    let mut fields: Vec<_> = global_fields.iter().collect();
+    fields.sort_unstable_by_key(|(key, _)| *key);
+
+    let mut result = String::new();
+    for (key, value) in fields {
+        if !result.is_empty() {
+            result.push(' ');
+        }
+        let _ = write!(result, "{}=\"{}\"", key, escape_log_text(value));
+    }
+    result
 }
 
 /// 结构化存储的 span 字段（保留插入顺序）。
@@ -134,26 +146,6 @@ where
     }
 }
 
-/// 将结构化 span 字段值转换为展示字符串（Pretty 格式用）
-fn span_value_to_string(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
-fn mask_string_if_sensitive(
-    sensitive_keys: &[String],
-    field_name: &str,
-    value: impl Into<String>,
-) -> serde_json::Value {
-    if is_sensitive_key(sensitive_keys, field_name) {
-        serde_json::Value::String(MASKED.to_string())
-    } else {
-        serde_json::Value::String(value.into())
-    }
-}
-
 /// 插入用户提供的字段，同时保留已存在字段。
 ///
 /// 事件字段优先以原名输出；保留键或同名字段会逐次添加下划线，而不是静默覆盖。
@@ -185,8 +177,7 @@ pub struct OwlFormatter {
     pub(crate) enable_ansi: bool,
     pub(crate) time_format: String,
     pub(crate) use_utc: bool,
-    pub(crate) global_fields: HashMap<String, String>,
-    pub(crate) sensitive_keys: Vec<String>,
+    pub(crate) global_fields: String,
 }
 
 impl OwlFormatter {
@@ -231,11 +222,10 @@ impl OwlFormatter {
     }
 }
 
-/// 用于 Pretty 格式的字段访问器，支持敏感数据脱敏
+/// 用于 Pretty 格式的字段访问器
 struct PrettyVisitor<'a> {
     message: &'a mut String,
     fields: &'a mut String,
-    sensitive_keys: &'a [String],
 }
 
 impl<'a> tracing::field::Visit for PrettyVisitor<'a> {
@@ -244,17 +234,13 @@ impl<'a> tracing::field::Visit for PrettyVisitor<'a> {
         let name = field.name();
         if name == "message" {
             self.message.clear();
-            self.message.push_str(value);
+            let _ = write!(self.message, "{}", escape_log_text(value));
             return;
         }
         if !self.fields.is_empty() {
             self.fields.push(' ');
         }
-        if is_sensitive_key(self.sensitive_keys, name) {
-            let _ = write!(self.fields, "{}=\"{}\"", name, MASKED);
-        } else {
-            let _ = write!(self.fields, "{}=\"{}\"", name, value);
-        }
+        let _ = write!(self.fields, "{}=\"{}\"", name, escape_log_text(value));
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
@@ -262,17 +248,14 @@ impl<'a> tracing::field::Visit for PrettyVisitor<'a> {
         let name = field.name();
         if name == "message" {
             let val_str = format!("{:?}", value);
-            *self.message = strip_debug_quotes(val_str);
+            *self.message = escape_log_text(&strip_debug_quotes(val_str)).to_string();
             return;
         }
         if !self.fields.is_empty() {
             self.fields.push(' ');
         }
-        if is_sensitive_key(self.sensitive_keys, name) {
-            let _ = write!(self.fields, "{}=\"{}\"", name, MASKED);
-        } else {
-            let _ = write!(self.fields, "{}={:?}", name, value);
-        }
+        let value = format!("{:?}", value);
+        let _ = write!(self.fields, "{}={}", name, escape_log_text(&value));
     }
 }
 
@@ -287,6 +270,8 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
+        use std::fmt::Write as _;
+
         // 时间 | 级别 |（Compact 格式使用空格分隔）
         self.write_timestamp(&mut writer)?;
         if self.compact {
@@ -318,24 +303,30 @@ where
                 let ext = span.extensions();
                 if let Some(fields) = ext.get::<OwlSpanFields>() {
                     if !fields.0.is_empty() {
-                        let mut masked_span_fields = String::new();
+                        let mut span_fields = String::new();
                         for (k, v) in &fields.0 {
-                            if !masked_span_fields.is_empty() {
-                                masked_span_fields.push_str(", ");
+                            if !span_fields.is_empty() {
+                                span_fields.push_str(", ");
                             }
-                            if is_sensitive_key(&self.sensitive_keys, k) {
-                                masked_span_fields.push_str(&format!("{}=\"{}\"", k, MASKED));
-                            } else {
-                                masked_span_fields.push_str(&format!(
-                                    "{}=\"{}\"",
-                                    k,
-                                    span_value_to_string(v)
-                                ));
+                            match v {
+                                serde_json::Value::String(value) => {
+                                    let _ =
+                                        write!(span_fields, "{}=\"{}\"", k, escape_log_text(value));
+                                }
+                                value => {
+                                    let value = value.to_string();
+                                    let _ = write!(
+                                        span_fields,
+                                        "{}=\"{}\"",
+                                        k,
+                                        escape_log_text(&value)
+                                    );
+                                }
                             }
                         }
 
-                        if !masked_span_fields.is_empty() {
-                            write!(writer, "{{{}}}", masked_span_fields)?;
+                        if !span_fields.is_empty() {
+                            write!(writer, "{{{}}}", span_fields)?;
                         }
                     }
                 }
@@ -405,36 +396,22 @@ where
         let mut visitor = PrettyVisitor {
             message: &mut message,
             fields: &mut fields_str,
-            sensitive_keys: &self.sensitive_keys,
         };
         event.record(&mut visitor);
 
-        // 拼接全局字段
-        let mut global_str = String::new();
-        for (k, v) in &self.global_fields {
-            if !global_str.is_empty() {
-                global_str.push(' ');
-            }
-            if is_sensitive_key(&self.sensitive_keys, k) {
-                global_str.push_str(&format!("{}=\"{}\"", k, MASKED));
-            } else {
-                global_str.push_str(&format!("{}=\"{}\"", k, v));
-            }
-        }
-
-        let full_msg = if global_str.is_empty() {
-            if fields_str.is_empty() {
-                message
-            } else {
-                format!("{} {}", message, fields_str)
-            }
-        } else if fields_str.is_empty() {
-            format!("{} {}", message, global_str)
-        } else {
-            format!("{} {} {}", message, fields_str, global_str)
-        };
-
         if self.enable_ansi {
+            let full_msg = if self.global_fields.is_empty() {
+                if fields_str.is_empty() {
+                    message
+                } else {
+                    format!("{} {}", message, fields_str)
+                }
+            } else if fields_str.is_empty() {
+                format!("{} {}", message, self.global_fields)
+            } else {
+                format!("{} {} {}", message, fields_str, self.global_fields)
+            };
+
             let level = event.metadata().level();
             match *level {
                 Level::ERROR => write!(writer, "{}", full_msg.red().bold())?,
@@ -442,8 +419,14 @@ where
                 Level::INFO => write!(writer, "{}", full_msg)?,
                 Level::DEBUG | Level::TRACE => write!(writer, "{}", full_msg.dimmed())?,
             }
+        } else if fields_str.is_empty() && self.global_fields.is_empty() {
+            write!(writer, "{}", message)?;
+        } else if self.global_fields.is_empty() {
+            write!(writer, "{} {}", message, fields_str)?;
+        } else if fields_str.is_empty() {
+            write!(writer, "{} {}", message, self.global_fields)?;
         } else {
-            write!(writer, "{}", full_msg)?;
+            write!(writer, "{} {} {}", message, fields_str, self.global_fields)?;
         }
         writeln!(writer)
     }
@@ -457,56 +440,46 @@ pub struct OwlJsonFormatter {
     pub(crate) time_format: String,
     pub(crate) use_utc: bool,
     pub(crate) global_fields: HashMap<String, String>,
-    pub(crate) sensitive_keys: Vec<String>,
 }
 
 struct JsonVisitor<'a> {
     map: &'a mut serde_json::Map<String, serde_json::Value>,
-    sensitive_keys: &'a [String],
 }
 
 impl<'a> tracing::field::Visit for JsonVisitor<'a> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         let name = field.name();
-        let val = mask_string_if_sensitive(self.sensitive_keys, name, value);
-        self.map.insert(name.to_string(), val);
+        self.map.insert(
+            name.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
         let name = field.name();
-        let val = if is_sensitive_key(self.sensitive_keys, name) {
-            serde_json::Value::String(MASKED.to_string())
-        } else {
-            serde_json::Value::Number(serde_json::Number::from(value))
-        };
-        self.map.insert(name.to_string(), val);
+        self.map.insert(
+            name.to_string(),
+            serde_json::Value::Number(serde_json::Number::from(value)),
+        );
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
         let name = field.name();
-        let val = if is_sensitive_key(self.sensitive_keys, name) {
-            serde_json::Value::String(MASKED.to_string())
-        } else {
-            serde_json::Value::Number(serde_json::Number::from(value))
-        };
-        self.map.insert(name.to_string(), val);
+        self.map.insert(
+            name.to_string(),
+            serde_json::Value::Number(serde_json::Number::from(value)),
+        );
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
         let name = field.name();
-        let val = if is_sensitive_key(self.sensitive_keys, name) {
-            serde_json::Value::String(MASKED.to_string())
-        } else {
-            serde_json::Value::Bool(value)
-        };
-        self.map.insert(name.to_string(), val);
+        self.map
+            .insert(name.to_string(), serde_json::Value::Bool(value));
     }
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
         let name = field.name();
-        let val = if is_sensitive_key(self.sensitive_keys, name) {
-            serde_json::Value::String(MASKED.to_string())
-        } else if let Some(num) = serde_json::Number::from_f64(value) {
+        let val = if let Some(num) = serde_json::Number::from_f64(value) {
             serde_json::Value::Number(num)
         } else {
             serde_json::Value::String(value.to_string())
@@ -517,18 +490,13 @@ impl<'a> tracing::field::Visit for JsonVisitor<'a> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let name = field.name();
         let val_str = format!("{:?}", value);
-        let val = if is_sensitive_key(self.sensitive_keys, name) {
-            serde_json::Value::String(MASKED.to_string())
+        let cleaned = if val_str.starts_with('"') && val_str.ends_with('"') && val_str.len() >= 2 {
+            val_str[1..val_str.len() - 1].to_string()
         } else {
-            let cleaned =
-                if val_str.starts_with('"') && val_str.ends_with('"') && val_str.len() >= 2 {
-                    val_str[1..val_str.len() - 1].to_string()
-                } else {
-                    val_str
-                };
-            serde_json::Value::String(cleaned)
+            val_str
         };
-        self.map.insert(name.to_string(), val);
+        self.map
+            .insert(name.to_string(), serde_json::Value::String(cleaned));
     }
 }
 
@@ -590,11 +558,10 @@ where
             }
         }
 
-        // 6. 收集并脱敏 Event 字段
+        // 6. 收集 Event 字段
         let mut fields_map = serde_json::Map::new();
         let mut visitor = JsonVisitor {
             map: &mut fields_map,
-            sensitive_keys: &self.sensitive_keys,
         };
         event.record(&mut visitor);
 
@@ -619,12 +586,7 @@ where
                 let ext = span.extensions();
                 if let Some(fields) = ext.get::<OwlSpanFields>() {
                     for (k, v) in &fields.0 {
-                        let value = if is_sensitive_key(&self.sensitive_keys, k) {
-                            serde_json::Value::String(MASKED.to_string())
-                        } else {
-                            v.clone()
-                        };
-                        insert_json_field(&mut log_obj, k, value);
+                        insert_json_field(&mut log_obj, k, v.clone());
                     }
                 }
             }
@@ -632,16 +594,10 @@ where
 
         // 9. 全局字段合并到顶层
         for (k, v) in &self.global_fields {
-            insert_json_field(
-                &mut log_obj,
-                k,
-                mask_string_if_sensitive(&self.sensitive_keys, k, v.clone()),
-            );
+            insert_json_field(&mut log_obj, k, serde_json::Value::String(v.clone()));
         }
 
-        if let Ok(serialized) = serde_json::to_string(&log_obj) {
-            write!(writer, "{}", serialized)?;
-        }
+        write!(writer, "{}", serde_json::Value::Object(log_obj))?;
         writeln!(writer)
     }
 }
@@ -660,8 +616,7 @@ pub(crate) fn file_formatter(
         enable_ansi: false, // 文件输出不带颜色
         time_format: config.time_format.clone(),
         use_utc: config.use_utc,
-        global_fields: config.global_fields.clone(),
-        sensitive_keys: config.sensitive_keys.clone(),
+        global_fields: format_global_fields(&config.global_fields),
     }
 }
 
@@ -679,15 +634,14 @@ pub(crate) fn console_formatter(
         enable_ansi: config.enable_ansi,
         time_format: config.time_format.clone(),
         use_utc: config.use_utc,
-        global_fields: config.global_fields.clone(),
-        sensitive_keys: config.sensitive_keys.clone(),
+        global_fields: format_global_fields(&config.global_fields),
     }
 }
 
 /// 用于文件输出的无色 Compact 格式化器。
 ///
-/// Compact 也必须经过 owl-logger 的字段访问器，保证脱敏和全局字段与 Pretty/JSON
-/// 输出保持一致，不能回退到 tracing-subscriber 的默认格式化器。
+/// Compact 也必须经过 owl-logger 的字段访问器，保证全局字段与 Pretty/JSON 输出保持
+/// 一致，不能回退到 tracing-subscriber 的默认格式化器。
 pub(crate) fn file_compact_formatter(
     language: Language,
     config: &crate::config::OwlConfig,
@@ -701,8 +655,7 @@ pub(crate) fn file_compact_formatter(
         enable_ansi: false,
         time_format: config.time_format.clone(),
         use_utc: config.use_utc,
-        global_fields: config.global_fields.clone(),
-        sensitive_keys: config.sensitive_keys.clone(),
+        global_fields: format_global_fields(&config.global_fields),
     }
 }
 
@@ -720,8 +673,7 @@ pub(crate) fn console_compact_formatter(
         enable_ansi: config.enable_ansi,
         time_format: config.time_format.clone(),
         use_utc: config.use_utc,
-        global_fields: config.global_fields.clone(),
-        sensitive_keys: config.sensitive_keys.clone(),
+        global_fields: format_global_fields(&config.global_fields),
     }
 }
 
@@ -730,35 +682,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sensitive_key_matching_is_case_insensitive() {
-        let keys = vec!["token".to_string(), "api_key".to_string()];
-
-        assert!(is_sensitive_key(&keys, "Token"));
-        assert!(is_sensitive_key(&keys, "access_token"));
-        assert!(is_sensitive_key(&keys, "apiSecretToken"));
-        assert!(is_sensitive_key(&keys, "API_KEY"));
-        assert!(!is_sensitive_key(&keys, "user"));
-        assert!(!is_sensitive_key(&["".to_string()], "user"));
-    }
-
-    #[test]
-    fn global_field_values_are_masked_when_sensitive() {
-        let keys = vec!["authorization".to_string()];
-
-        assert_eq!(
-            mask_string_if_sensitive(&keys, "Authorization", "Bearer secret"),
-            serde_json::Value::String(MASKED.to_string())
-        );
-        assert_eq!(
-            mask_string_if_sensitive(&keys, "env", "prod"),
-            serde_json::Value::String("prod".to_string())
-        );
-    }
-
-    #[test]
     fn strip_debug_quotes_removes_outer_quotes_only() {
         assert_eq!(strip_debug_quotes("\"req-001\"".to_string()), "req-001");
         assert_eq!(strip_debug_quotes("42".to_string()), "42");
         assert_eq!(strip_debug_quotes("\"\"".to_string()), "");
+    }
+
+    #[test]
+    fn text_log_escaping_keeps_entries_single_line_and_readable() {
+        assert_eq!(
+            escape_log_text("line 1\nline 2").to_string(),
+            "line 1\\nline 2"
+        );
+        assert_eq!(escape_log_text("a\"b\\c\r").to_string(), "a\\\"b\\\\c\\r");
+        assert_eq!(escape_log_text("中文").to_string(), "中文");
+    }
+
+    #[test]
+    fn global_fields_are_preformatted_in_stable_order() {
+        let mut fields = HashMap::new();
+        fields.insert("z".to_string(), "last".to_string());
+        fields.insert("a".to_string(), "first\nline".to_string());
+
+        assert_eq!(
+            format_global_fields(&fields),
+            "a=\"first\\nline\" z=\"last\""
+        );
     }
 }

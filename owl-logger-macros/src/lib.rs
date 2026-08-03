@@ -15,7 +15,7 @@ use syn::{
 /// ## 参数
 ///
 /// - `level = "debug"`：监控日志级别（默认 `info`）。
-/// - `skip(a, b)`：脱敏指定参数，输出为 `[REDACTED]`。
+/// - `skip(a, b)`：省略指定参数，输出为 `[REDACTED]`。
 /// - `skip_all`：不记录任何参数，避免参数必须实现 `Debug`。
 /// - `skip_return`：不记录返回值，也不进行 Result::Err 自动升级。
 /// - `slow_ms = 200`：超过该毫秒数时以 WARN 级别标记 `SLOW`。

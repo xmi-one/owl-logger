@@ -71,8 +71,8 @@ fn main() {
     let calculated = calculate_discount(100.0, 0.8);
     owl_logger::debug!(calculated = calculated, "折扣计算完成");
 
-    // 9. 测试 #[monitor] 属性宏（WARN 级别，敏感字段脱敏 [REDACTED]）
-    println!("\n>>> 测试 #[monitor] 属性宏（WARN 级别 + skip 参数脱敏）：");
+    // 9. 测试 #[monitor] 属性宏（WARN 级别，省略 password 参数）
+    println!("\n>>> 测试 #[monitor] 属性宏（WARN 级别 + skip 参数）：");
     let logged_in = login("admin", "super_secret_password");
     owl_logger::info!(logged_in = logged_in, "登录验证结束");
 
@@ -93,7 +93,7 @@ fn calculate_discount(price: f64, rate: f64) -> f64 {
     price * rate
 }
 
-// 9. 自定义级别为 warn，跳过敏感字段 password
+// 9. 自定义级别为 warn，省略 password 参数
 #[owl_logger::monitor(level = "warn", skip(password))]
 fn login(username: &str, password: &str) -> bool {
     owl_logger::warn!("正在尝试非安全登录连接...");

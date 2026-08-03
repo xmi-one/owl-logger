@@ -1,4 +1,4 @@
-//! 集成测试：JSON 输出格式与敏感数据脱敏端到端行为。
+//! 集成测试：JSON 输出格式会原样保留事件字段值。
 
 use owl_logger::{OutputFormat, RotationPolicy};
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ fn unique_temp_dir(tag: &str) -> PathBuf {
 }
 
 #[test]
-fn json_output_masks_sensitive_fields() {
+fn json_output_preserves_event_field_values() {
     let dir = unique_temp_dir("json");
 
     {
@@ -37,7 +37,6 @@ fn json_output_masks_sensitive_fields() {
 
     let content = std::fs::read_to_string(dir.join("app.log")).expect("log must exist");
 
-    // 找到包含我们消息的那一行并解析为 JSON
     let line = content
         .lines()
         .find(|l| l.contains("login attempt"))
@@ -48,8 +47,8 @@ fn json_output_masks_sensitive_fields() {
     assert_eq!(value["message"], "login attempt");
     assert_eq!(value["level"], "WARN");
     assert_eq!(
-        value["password"], "[MASKED]",
-        "sensitive field must be masked"
+        value["password"], "super-secret",
+        "event field values must not be changed"
     );
     assert_eq!(value["user"], "bob");
     assert_eq!(value["attempts"], 3);

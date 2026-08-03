@@ -214,22 +214,6 @@ impl OwlLoggerBuilder {
         self
     }
 
-    /// 重新设定敏感词列表
-    pub fn sensitive_keys<I, S>(mut self, keys: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.config.sensitive_keys = keys.into_iter().map(|k| k.into()).collect();
-        self
-    }
-
-    /// 添加敏感词
-    pub fn sensitive_key(mut self, key: impl Into<String>) -> Self {
-        self.config.sensitive_keys.push(key.into());
-        self
-    }
-
     /// 设置日志文件保留天数
     pub fn retention_days(mut self, days: usize) -> Self {
         self.config.retention_days = Some(days);
@@ -345,7 +329,6 @@ impl OwlLoggerBuilder {
                         time_format: config.time_format.clone(),
                         use_utc: config.use_utc,
                         global_fields: config.global_fields.clone(),
-                        sensitive_keys: config.sensitive_keys.clone(),
                     };
                     tracing_subscriber::fmt::layer()
                         .with_writer(non_blocking)
@@ -610,7 +593,6 @@ where
                 time_format: config.time_format.clone(),
                 use_utc: config.use_utc,
                 global_fields: config.global_fields.clone(),
-                sensitive_keys: config.sensitive_keys.clone(),
             };
             tracing_subscriber::fmt::layer()
                 .with_writer(non_blocking)

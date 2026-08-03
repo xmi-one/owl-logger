@@ -10,9 +10,9 @@
 
 - 🚀 **一行初始化** — 零配置即可开始使用
 - 🎨 **彩色输出** — 控制台日志带有颜色高亮，自动对齐
+- 🧾 **单行文本日志** — Pretty / Compact 输出会转义换行、引号和反斜杠，避免一条事件被拆成多行
 - 🔄 **动态调整** — 运行时动态获取、更改日志级别与过滤规则，无需重启服务
-- 🔒 **敏感数据脱敏** — 内置敏感关键字检测（如 `password`, `token`），输出时自动脱敏为 `"[MASKED]"`
-- 🗜️ **可靠日志压缩** — 支持大小轮转后自动把旧日志打包压缩为 `.gz` 文件
+- 🗜️ **大小轮转压缩** — `SizeMB` 轮转后使用 Gzip 将旧日志压缩为 `.gz` 文件
 - 🧹 **保留期自动清理** — 支持设定日志保留天数，在独立后台线程中自动清理过期的历史日志文件
 - 🚨 **按级别分文件** — 可将达到指定级别（如 `ERROR`）的日志额外单独写入 `{file}.error.log`，便于运维定位
 - 🛰️ **OpenTelemetry/OTLP 导出** — 通过 `otlp` feature 将追踪 span 导出到 Jaeger / Tempo / OTel Collector（OTLP/HTTP，无需 Tokio 运行时）
@@ -28,7 +28,7 @@
 
 ```toml
 [dependencies]
-owl-logger = "0.2.4"
+owl-logger = "0.3.0"
 ```
 
 MSRV：Rust 1.88。
@@ -59,8 +59,7 @@ fn main() {
         .language(Language::Zh)
         .level(LogLevel::Info)
         .rotation(RotationPolicy::SizeMB(10)) // 每 10MB 轮转并压缩
-        .global_field("env", "production")     // 添加全局字段
-        .sensitive_key("api_key")             // 添加脱敏词
+        .global_field("env", "production") // 添加全局字段
         .retention_days(7)                    // 日志保留 7 天
         .show_line_number(true)
         .init();
@@ -121,9 +120,9 @@ fn perform_action(user: &str) -> Result<String, String> {
 | 参数 | 说明 |
 |:---|:---|
 | `level = "debug"` | 监控日志级别（默认 `info`） |
-| `skip(a, b)` | 将指定参数脱敏为 `[REDACTED]` |
-| `skip_all` | 不记录任何参数，适用于参数未实现 `Debug` 或整体敏感的函数 |
-| `skip_return` | 不记录返回值；同时关闭 Result::Err 自动升级，适用于返回值未实现 `Debug` 或敏感返回值 |
+| `skip(a, b)` | 省略指定参数，输出为 `[REDACTED]` |
+| `skip_all` | 不记录任何参数，适用于参数未实现 `Debug` 或不应输出参数的函数 |
+| `skip_return` | 不记录返回值；同时关闭 Result::Err 自动升级，适用于返回值未实现 `Debug` 或不应输出返回值的函数 |
 | `slow_ms = 200` | 超过该毫秒数时以 WARN 级别标记 `SLOW` |
 | `span`（或 `span = true`） | 为函数体建立 `tracing::Span`，使函数**内部**的日志自动带上以函数名命名的上下文 |
 
@@ -137,19 +136,13 @@ fn handle(req_id: u64) {
 }
 ```
 
-### 3. 敏感数据安全脱敏 (PII Masking)
+### 3. 文本日志转义与字段输出
 
-在控制台和 JSON 格式输出中，只要日志字段名（大小写无关、包含匹配）命中脱敏关键字列表，其具体数值将被自动脱敏过滤：
+Pretty 和 Compact 格式会将字段值及消息中的换行、回车、引号和反斜杠转义为可读的单行文本，例如换行会输出为 `\n`。这能避免外部输入把单条日志伪造成多条日志。
 
-```rust
-// 默认脱敏字段包括 password, token, secret, authorization, credit_card
-tracing::warn!(
-    password = "secret-plain-text",
-    user = "bob",
-    "用户密码登录尝试"
-);
-// 输出中将以: password="[MASKED]" user="bob" 形式呈现，防泄漏安全合规
-```
+全局字段会按字段名稳定排序后附加到每条文本日志。字段值不会再按字段名自动替换或隐藏；请勿将密码、令牌等机密信息直接写入日志。
+
+JSON 格式使用标准 JSON 序列化，保留字段的原始值，并由 JSON 转义控制字符。
 
 ### 4. 请求上下文追踪 (MDC)
 
@@ -185,10 +178,8 @@ fn main() {
 | `.level(level)` | `Info` | 最低日志过滤级别 |
 | `.language(lang)` | `En` | 系统提示词语言（En / Zh） |
 | `.format(fmt)` | `Pretty` | 输出格式（Pretty / Compact / Json） |
-| `.rotation(policy)` | `Daily` | 文件轮转策略（Daily / Hourly / SizeMB(mb) / Never） |
+| `.rotation(policy)` | `Daily` | 文件轮转策略；仅 `SizeMB(mb)` 轮转会将历史文件压缩为 `.gz`，`Daily` / `Hourly` 仅归档不压缩 |
 | `.global_field(k, v)` | - | 全局属性字段，会自动平铺附加在每条日志中 |
-| `.sensitive_key(key)` | - | 追加单个脱敏词（如密码、Token 字段名） |
-| `.sensitive_keys(keys)` | - | 重新覆盖脱敏词列表 |
 | `.retention_days(days)` | `Some(7)` | 日志过期天数（后台定期清理，默认保留 7 天） |
 | `.error_file(level)` | `None` | 额外写入 `{file}.{level}.log`，仅记录达到或严重于该级别的日志 |
 | `.otlp_endpoint(url)` | `None` | OTLP/HTTP 导出端点（需启用 `otlp` feature） |
@@ -238,7 +229,7 @@ let _guard = owl_logger::builder()
     .init();
 ```
 
-`error_file(LogLevel::Warn)` 则会生成 `app.warn.log`，同时包含 WARN 与 ERROR。该独立文件与主文件共享相同的轮转、压缩与清理策略。
+`error_file(LogLevel::Warn)` 则会生成 `app.warn.log`，同时包含 WARN 与 ERROR。该独立文件与主文件共享相同的轮转与清理策略；使用 `SizeMB` 轮转时，历史文件同样会压缩为 `.gz`。
 
 ### 6. OpenTelemetry / OTLP 分布式追踪
 
@@ -246,7 +237,7 @@ let _guard = owl_logger::builder()
 
 ```toml
 [dependencies]
-owl-logger = { version = "0.2.4", features = ["otlp"] }
+owl-logger = { version = "0.3.0", features = ["otlp"] }
 ```
 
 ```rust
