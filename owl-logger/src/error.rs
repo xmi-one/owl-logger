@@ -2,12 +2,13 @@ use std::fmt;
 
 /// owl-logger 错误类型
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum OwlError {
     /// 全局 subscriber 已经被设置
     AlreadyInitialized,
     /// 日志目录创建失败
     LogDirCreation(std::io::Error),
-    /// 日志文件 appender 创建失败
+    /// 日志文件 appender 创建或打开失败
     FileAppenderCreation(String),
     /// 环境过滤器解析失败
     EnvFilter(String),
@@ -15,6 +16,8 @@ pub enum OwlError {
     Reload(String),
     /// 日志系统未初始化
     NotInitialized,
+    /// 主动 flush 等待超时
+    FlushTimeout,
     /// 其他错误
     Other(String),
 }
@@ -39,6 +42,9 @@ impl fmt::Display for OwlError {
             }
             OwlError::NotInitialized => {
                 write!(f, "owl-logger: logger not initialized")
+            }
+            OwlError::FlushTimeout => {
+                write!(f, "owl-logger: timed out while flushing buffered logs")
             }
             OwlError::Other(msg) => {
                 write!(f, "owl-logger: {msg}")

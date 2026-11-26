@@ -31,7 +31,11 @@ fn error_file_only_captures_error_and_above() {
 
         tracing::info!("plain info line");
         tracing::warn!("a warning line");
-        tracing::error!("boom error line");
+        {
+            let span = tracing::info_span!("db_tx", order_id = "ORD-777");
+            let _enter = span.enter();
+            tracing::error!("boom error line");
+        }
     } // drop guard -> flush
 
     let main = std::fs::read_to_string(dir.join("app.log")).expect("main log must exist");
@@ -41,8 +45,12 @@ fn error_file_only_captures_error_and_above() {
     assert!(main.contains("plain info line"), "main log missing info");
     assert!(main.contains("boom error line"), "main log missing error");
 
-    // 分级文件仅包含 ERROR
+    // 分级文件仅包含 ERROR，且完整保留常规 INFO 级别 Span 的上下文字段
     assert!(err.contains("boom error line"), "error log missing error");
+    assert!(
+        err.contains("db_tx") && err.contains("order_id=\"ORD-777\""),
+        "error log must preserve info_span context: {err}"
+    );
     assert!(
         !err.contains("plain info line"),
         "error log must not contain info: {err}"

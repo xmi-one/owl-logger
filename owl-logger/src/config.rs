@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 /// 日志级别（映射到 tracing::Level）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -31,6 +32,17 @@ impl LogLevel {
             LogLevel::Info => tracing_subscriber::filter::LevelFilter::INFO,
             LogLevel::Warn => tracing_subscriber::filter::LevelFilter::WARN,
             LogLevel::Error => tracing_subscriber::filter::LevelFilter::ERROR,
+        }
+    }
+
+    /// 返回日志详细程度权重（数值越大越详细：Trace(5) > ... > Error(1)）
+    pub(crate) fn verbosity_rank(self) -> u8 {
+        match self {
+            LogLevel::Error => 1,
+            LogLevel::Warn => 2,
+            LogLevel::Info => 3,
+            LogLevel::Debug => 4,
+            LogLevel::Trace => 5,
         }
     }
 }
@@ -88,12 +100,20 @@ pub struct OwlConfig {
     pub file_name: String,
     /// 日志文件存放目录
     pub log_dir: String,
-    /// 最低日志级别
+    /// 全局最低日志级别
     pub level: LogLevel,
+    /// 控制台独立最低级别（为 `None` 时继承全局过滤器）
+    pub console_level: Option<LogLevel>,
+    /// 主文件独立最低级别（为 `None` 时继承全局过滤器）
+    pub file_level: Option<LogLevel>,
     /// 输出语言
     pub language: Language,
-    /// 输出格式
+    /// 默认输出格式
     pub format: OutputFormat,
+    /// 控制台独立输出格式（为 `None` 时使用 `format`）
+    pub console_format: Option<OutputFormat>,
+    /// 文件独立输出格式（为 `None` 时使用 `format`）
+    pub file_format: Option<OutputFormat>,
     /// 文件轮转策略
     pub rotation: RotationPolicy,
     /// 是否启用控制台输出
@@ -118,18 +138,24 @@ pub struct OwlConfig {
     pub catch_panic: bool,
     /// 全局常量字段（会自动附加到每条日志）
     pub global_fields: std::collections::HashMap<String, String>,
-    /// 日志保留天数（超过此天数的日志文件会被自动清理）
+    /// 日志保留天数（超过此天数的日志文件会被自动清理；`None` 或 `Some(0)` 表示不限）
     pub retention_days: Option<usize>,
     /// 异步非阻塞队列的容量限制
     pub buffered_lines_limit: usize,
-    /// 队列满时是否允许丢弃日志（false 则阻塞当前线程）
+    /// 队列满时是否允许立即丢弃日志（`false` 则阻塞等待，可配合 `queue_timeout` 设置最大等待时长）
     pub lossy: bool,
+    /// 当 `lossy == false` 时，生产者队列满的最大阻塞等待时间（`None` 表示无限等待直至有空位）
+    pub queue_timeout: Option<Duration>,
+    /// 刷盘与停机等待后台工作线程排空的超时上限（`None` 表示无限等待；默认 30 秒）
+    pub shutdown_timeout: Option<Duration>,
+    /// 多进程部署时是否自动在文件名前缀追加 `.pid{pid}` 实现物理隔离（默认关闭）
+    pub process_isolation: bool,
     /// 按级别分离的独立日志文件阈值。
     ///
     /// 若设置为 `Some(level)`，则会额外写入一个 `{file_name}.{level}.log` 文件，
     /// 仅记录达到或严重于该级别的日志（例如 `Error` 仅记录 ERROR，`Warn` 记录 WARN+ERROR）。
     pub error_file_level: Option<LogLevel>,
-    /// OTLP 导出端点（OTLP/HTTP，如 `http://localhost:4318/v1/traces`）。
+    /// OTLP 导出端点（OTLP/HTTP，如 `http://localhost:4318/v1/traces` 或 `https://...`）。
     ///
     /// 仅在启用 `otlp` feature 时生效；为 `None` 时不导出。
     pub otlp_endpoint: Option<String>,
@@ -145,8 +171,12 @@ impl Default for OwlConfig {
             file_name: "app".to_string(),
             log_dir: "logs".to_string(),
             level: LogLevel::default(),
+            console_level: None,
+            file_level: None,
             language: Language::default(),
             format: OutputFormat::default(),
+            console_format: None,
+            file_format: None,
             rotation: RotationPolicy::default(),
             enable_console: true,
             enable_file: true,
@@ -162,6 +192,9 @@ impl Default for OwlConfig {
             retention_days: Some(7),
             buffered_lines_limit: 120_000,
             lossy: true,
+            queue_timeout: None,
+            shutdown_timeout: Some(Duration::from_secs(30)),
+            process_isolation: false,
             error_file_level: None,
             otlp_endpoint: None,
             otlp_service_name: None,

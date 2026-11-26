@@ -1,6 +1,6 @@
 [package]
 name = "owl-logger"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.88.0"
 description = "A production-ready, ergonomic logging library for Rust — inspired by Python's xmi_logger, powered by tracing."
@@ -13,18 +13,17 @@ categories = ["development-tools::debugging"]
 [dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "registry"] }
-tracing-appender = "0.2"
 tracing-log = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 owo-colors = "4"
 flate2 = "1.0"
 serde_json = "1.0"
-owl-logger-macros = { path = "../owl-logger-macros", version = "0.3.1" }
+owl-logger-macros = { path = "../owl-logger-macros", version = "=0.4.0" }
 
 # OpenTelemetry / OTLP 分布式追踪导出（默认关闭，通过 `otlp` feature 开启）
 opentelemetry = { version = "0.32", optional = true, default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.32", optional = true, default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
 tracing-opentelemetry = { version = "0.33", optional = true }
 
 [features]

@@ -1,5 +1,7 @@
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
+use std::time::SystemTime;
 
 use owo_colors::OwoColorize;
 use tracing::span::{Attributes, Record};
@@ -9,7 +11,7 @@ use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::config::Language;
+use crate::config::{Language, OwlConfig};
 use crate::i18n::I18n;
 
 const RESERVED_KEYS: &[&str] = &[
@@ -22,13 +24,213 @@ const RESERVED_KEYS: &[&str] = &[
     "line",
 ];
 
-/// 去除 `{:?}` 调试格式化产生的最外层引号（如 `"req-001"` -> `req-001`）
-fn strip_debug_quotes(s: String) -> String {
-    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        s[1..s.len() - 1].to_string()
+/// 单线程格式化复用缓冲区的容量上限阈值（超过后自动回缩，防止偶发超大日志长期占用 TLS 内存）。
+const SCRATCH_SHRINK_THRESHOLD: usize = 16 * 1024;
+const SCRATCH_SHRINK_TARGET: usize = 512;
+const SEEN_KEYS_SHRINK_THRESHOLD: usize = 256;
+const SEEN_KEYS_SHRINK_TARGET: usize = 32;
+
+thread_local! {
+    /// 缓存当前正在分发的 `Event` 对应的系统时间戳（附带栈地址校验），
+    /// 确保同一条日志在控制台、主文件与分级错误文件中的时间戳严格一致，且每条事件只触发一次时钟系统调用。
+    static CURRENT_EVENT_TS: Cell<Option<(usize, SystemTime)>> = const { Cell::new(None) };
+
+    /// Pretty / Compact 格式化器的线程局部复用缓冲，消除稳态下每条日志的临时 `String` 堆分配。
+    static TEXT_SCRATCH: RefCell<TextScratch> = const { RefCell::new(TextScratch::new()) };
+
+    /// JSON 格式化器的线程局部流式序列化缓冲，消除 `serde_json::Map` (`BTreeMap`) 及元数据克隆分配。
+    static JSON_SCRATCH: RefCell<JsonScratch> = const { RefCell::new(JsonScratch::new()) };
+}
+
+struct TextScratch {
+    message: String,
+    fields: String,
+    debug_buf: String,
+}
+
+impl TextScratch {
+    const fn new() -> Self {
+        Self {
+            message: String::new(),
+            fields: String::new(),
+            debug_buf: String::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.message.clear();
+        self.fields.clear();
+        self.debug_buf.clear();
+    }
+
+    fn shrink_if_oversized(&mut self) {
+        if self.message.capacity() > SCRATCH_SHRINK_THRESHOLD {
+            self.message.shrink_to(SCRATCH_SHRINK_TARGET);
+        }
+        if self.fields.capacity() > SCRATCH_SHRINK_THRESHOLD {
+            self.fields.shrink_to(SCRATCH_SHRINK_TARGET);
+        }
+        if self.debug_buf.capacity() > SCRATCH_SHRINK_THRESHOLD {
+            self.debug_buf.shrink_to(SCRATCH_SHRINK_TARGET);
+        }
+    }
+}
+
+struct JsonScratch {
+    buf: Vec<u8>,
+    message_val: Vec<u8>,
+    debug_buf: String,
+    ts_buf: String,
+    key_arena: String,
+    seen_ranges: Vec<(usize, usize)>,
+    key_work: String,
+}
+
+impl JsonScratch {
+    const fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            message_val: Vec::new(),
+            debug_buf: String::new(),
+            ts_buf: String::new(),
+            key_arena: String::new(),
+            seen_ranges: Vec::new(),
+            key_work: String::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.message_val.clear();
+        self.debug_buf.clear();
+        self.ts_buf.clear();
+        self.key_arena.clear();
+        self.seen_ranges.clear();
+        self.key_work.clear();
+    }
+
+    fn shrink_if_oversized(&mut self) {
+        if self.buf.capacity() > SCRATCH_SHRINK_THRESHOLD {
+            self.buf.shrink_to(SCRATCH_SHRINK_TARGET);
+        }
+        if self.message_val.capacity() > SCRATCH_SHRINK_THRESHOLD {
+            self.message_val.shrink_to(SCRATCH_SHRINK_TARGET);
+        }
+        if self.debug_buf.capacity() > SCRATCH_SHRINK_THRESHOLD {
+            self.debug_buf.shrink_to(SCRATCH_SHRINK_TARGET);
+        }
+        if self.ts_buf.capacity() > SCRATCH_SHRINK_THRESHOLD {
+            self.ts_buf.shrink_to(SCRATCH_SHRINK_TARGET);
+        }
+        if self.key_arena.capacity() > SCRATCH_SHRINK_THRESHOLD {
+            self.key_arena.shrink_to(SCRATCH_SHRINK_TARGET);
+        }
+        if self.key_work.capacity() > SCRATCH_SHRINK_THRESHOLD {
+            self.key_work.shrink_to(SCRATCH_SHRINK_TARGET);
+        }
+        if self.seen_ranges.capacity() > SEEN_KEYS_SHRINK_THRESHOLD {
+            self.seen_ranges.shrink_to(SEEN_KEYS_SHRINK_TARGET);
+        }
+    }
+
+    #[inline]
+    fn contains_seen(&self, candidate: &str) -> bool {
+        self.seen_ranges
+            .iter()
+            .any(|&(start, end)| &self.key_arena[start..end] == candidate)
+    }
+
+    #[inline]
+    fn record_seen_from_work(&mut self) {
+        let start = self.key_arena.len();
+        self.key_arena.push_str(&self.key_work);
+        self.seen_ranges.push((start, self.key_arena.len()));
+    }
+
+    /// 计算与保留键/已输出键不冲突的键名，并直接将 `,"<key>":` 流式写入 `self.buf`。
+    ///
+    /// 冲突消解语义与历史 `insert_json_field` 完全一致：保留键或重名键在前缀逐次叠加 `_`。
+    fn write_unique_field_prefix(&mut self, raw_key: &str) {
+        let is_reserved = RESERVED_KEYS.contains(&raw_key);
+        if !is_reserved && !self.contains_seen(raw_key) {
+            let start = self.key_arena.len();
+            self.key_arena.push_str(raw_key);
+            self.seen_ranges.push((start, self.key_arena.len()));
+
+            self.buf.push(b',');
+            let _ = serde_json::to_writer(&mut self.buf, raw_key);
+            self.buf.push(b':');
+            return;
+        }
+
+        self.key_work.clear();
+        if is_reserved {
+            self.key_work.push('_');
+        }
+        self.key_work.push_str(raw_key);
+        while self.contains_seen(&self.key_work) {
+            self.key_work.insert(0, '_');
+        }
+        self.record_seen_from_work();
+
+        self.buf.push(b',');
+        let _ = serde_json::to_writer(&mut self.buf, &self.key_work);
+        self.buf.push(b':');
+    }
+}
+
+#[inline]
+fn event_system_time(event: &Event<'_>) -> SystemTime {
+    let ptr = std::ptr::from_ref(event) as usize;
+    CURRENT_EVENT_TS
+        .get()
+        .and_then(|(cached_ptr, ts)| (cached_ptr == ptr).then_some(ts))
+        .unwrap_or_else(SystemTime::now)
+}
+
+/// 校验字符串是否为**单个**经合法转义的单行引号包裹字面量（如 `"req-001"` 或 `"a\"b"`）。
+///
+/// 若内部出现未转义的 `"`（如 `%` Display 传入 `"guest" role="admin"` 或 `"a" and "b"`）、
+/// 含有原始控制字符（`< 0x20` 或 `0x7f`）或末尾 `"` 实际被 `\` 转义，均返回 `false`，
+/// 从而彻底阻断文本日志键值注入并防止外层引号被误剥离。
+fn is_single_escaped_quoted_str(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+        return false;
+    }
+
+    let mut escaped = false;
+    for &b in &bytes[1..bytes.len() - 1] {
+        if b < 0x20 || b == 0x7f {
+            return false;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            return false;
+        }
+    }
+    !escaped
+}
+
+/// 去除 `{:?}` 调试格式化为单个字符串字面量时产生的最外层引号（如 `"req-001"` -> `req-001`）。
+///
+/// 对包含多个引号片段的普通文本（如 `"\"quoted\" and \"more\""`）保持原样，不破坏内部引号配对。
+fn strip_debug_quotes_ref(s: &str) -> &str {
+    if is_single_escaped_quoted_str(s) {
+        &s[1..s.len() - 1]
     } else {
         s
     }
+}
+
+#[cfg(test)]
+fn strip_debug_quotes(s: String) -> String {
+    strip_debug_quotes_ref(&s).to_string()
 }
 
 /// Escapes control characters, quotes, and backslashes before including user data in a
@@ -53,24 +255,32 @@ fn format_global_fields(global_fields: &HashMap<String, String>) -> String {
     result
 }
 
-/// 结构化存储的 span 字段（保留插入顺序）。
+fn sorted_json_global_fields(global_fields: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = global_fields
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    pairs.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    pairs
+}
+
+/// 结构化存储的 span 字段（保留插入顺序，使用静态字段名避免堆分配）。
 ///
-/// 由 [`OwlSpanLayer`] 在 span 创建/记录时填充，格式化阶段直接读取，
-/// 取代对格式化字符串做脆弱反向解析的旧实现。
+/// 由 [`OwlSpanLayer`] 在 span 创建/记录时填充，格式化阶段直接读取。
 #[derive(Debug, Default)]
-pub(crate) struct OwlSpanFields(pub(crate) Vec<(String, serde_json::Value)>);
+pub(crate) struct OwlSpanFields(pub(crate) Vec<(&'static str, serde_json::Value)>);
 
 /// 把 span 字段收集为结构化 `serde_json::Value` 的访问器
 struct SpanFieldVisitor<'a> {
-    fields: &'a mut Vec<(String, serde_json::Value)>,
+    fields: &'a mut Vec<(&'static str, serde_json::Value)>,
 }
 
 impl<'a> SpanFieldVisitor<'a> {
-    fn push(&mut self, name: &str, value: serde_json::Value) {
-        if let Some(slot) = self.fields.iter_mut().find(|(k, _)| k == name) {
+    fn push(&mut self, name: &'static str, value: serde_json::Value) {
+        if let Some(slot) = self.fields.iter_mut().find(|(k, _)| *k == name) {
             slot.1 = value;
         } else {
-            self.fields.push((name.to_string(), value));
+            self.fields.push((name, value));
         }
     }
 }
@@ -94,6 +304,22 @@ impl<'a> tracing::field::Visit for SpanFieldVisitor<'a> {
         );
     }
 
+    fn record_i128(&mut self, field: &tracing::field::Field, value: i128) {
+        let val = match i64::try_from(value) {
+            Ok(narrow) => serde_json::Value::Number(serde_json::Number::from(narrow)),
+            Err(_) => serde_json::Value::String(value.to_string()),
+        };
+        self.push(field.name(), val);
+    }
+
+    fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
+        let val = match u64::try_from(value) {
+            Ok(narrow) => serde_json::Value::Number(serde_json::Number::from(narrow)),
+            Err(_) => serde_json::Value::String(value.to_string()),
+        };
+        self.push(field.name(), val);
+    }
+
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
         self.push(field.name(), serde_json::Value::Bool(value));
     }
@@ -106,12 +332,13 @@ impl<'a> tracing::field::Visit for SpanFieldVisitor<'a> {
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        let cleaned = strip_debug_quotes(format!("{value:?}"));
+        let raw = format!("{value:?}");
+        let cleaned = strip_debug_quotes_ref(&raw).to_string();
         self.push(field.name(), serde_json::Value::String(cleaned));
     }
 }
 
-/// 收集 span 字段并以结构化形式存入 span extensions 的 Layer
+/// 收集 span 字段并在事件进入各输出通道前统一采样事件时间戳的 Layer。
 pub(crate) struct OwlSpanLayer;
 
 impl<S> Layer<S> for OwlSpanLayer
@@ -144,30 +371,25 @@ where
             }
         }
     }
-}
 
-/// 插入用户提供的字段，同时保留已存在字段。
-///
-/// 事件字段优先以原名输出；保留键或同名字段会逐次添加下划线，而不是静默覆盖。
-fn insert_json_field(
-    log_obj: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    value: serde_json::Value,
-) {
-    let mut output_key = if RESERVED_KEYS.contains(&key) {
-        format!("_{key}")
-    } else {
-        key.to_string()
-    };
-
-    while log_obj.contains_key(&output_key) {
-        output_key.insert(0, '_');
+    #[inline]
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let ptr = std::ptr::from_ref(event) as usize;
+        CURRENT_EVENT_TS.set(Some((ptr, SystemTime::now())));
     }
-
-    log_obj.insert(output_key, value);
 }
 
-/// owl-logger 自定义格式化器（Pretty / 文本格式）
+/// 位于所有输出 Layer 之后的最外层清理 Layer，在单次事件分发结束时清理缓存的时间戳指针。
+pub(crate) struct OwlEventCleanupLayer;
+
+impl<S: Subscriber> Layer<S> for OwlEventCleanupLayer {
+    #[inline]
+    fn on_event(&self, _event: &Event<'_>, _ctx: Context<'_, S>) {
+        CURRENT_EVENT_TS.set(None);
+    }
+}
+
+/// owl-logger 自定义格式化器（Pretty / Compact 文本格式）
 pub struct OwlFormatter {
     pub(crate) language: Language,
     pub(crate) compact: bool,
@@ -182,7 +404,6 @@ pub struct OwlFormatter {
 
 impl OwlFormatter {
     /// 直接把级别名（带颜色）写入 writer，避免中间 String 分配。
-    /// I18n::level_name 返回的名称已对齐到 5 字符宽度。
     fn write_level(&self, w: &mut Writer<'_>, level: &Level) -> fmt::Result {
         let name = I18n::level_name(level, self.language);
         if self.enable_ansi {
@@ -198,12 +419,12 @@ impl OwlFormatter {
         }
     }
 
-    /// 直接把时间戳（带颜色）写入 writer，避免中间 String 分配
-    fn write_timestamp(&self, w: &mut Writer<'_>) -> fmt::Result {
+    /// 直接把时间戳（带颜色）写入 writer，避免中间 String 分配，并与其余输出通道共享同一采样时间。
+    fn write_timestamp(&self, w: &mut Writer<'_>, sys_time: SystemTime) -> fmt::Result {
         let ts = if self.use_utc {
-            chrono::Utc::now().format(&self.time_format)
+            chrono::DateTime::<chrono::Utc>::from(sys_time).format(&self.time_format)
         } else {
-            chrono::Local::now().format(&self.time_format)
+            chrono::DateTime::<chrono::Local>::from(sys_time).format(&self.time_format)
         };
         if self.enable_ansi {
             write!(w, "{}", ts.dimmed())
@@ -222,10 +443,20 @@ impl OwlFormatter {
     }
 }
 
-/// 用于 Pretty 格式的字段访问器
+/// 用于 Pretty / Compact 格式的字段访问器
 struct PrettyVisitor<'a> {
     message: &'a mut String,
     fields: &'a mut String,
+    debug_buf: &'a mut String,
+}
+
+impl<'a> PrettyVisitor<'a> {
+    #[inline]
+    fn push_field_sep(&mut self) {
+        if !self.fields.is_empty() {
+            self.fields.push(' ');
+        }
+    }
 }
 
 impl<'a> tracing::field::Visit for PrettyVisitor<'a> {
@@ -237,26 +468,130 @@ impl<'a> tracing::field::Visit for PrettyVisitor<'a> {
             let _ = write!(self.message, "{}", escape_log_text(value));
             return;
         }
-        if !self.fields.is_empty() {
-            self.fields.push(' ');
-        }
+        self.push_field_sep();
         let _ = write!(self.fields, "{}=\"{}\"", name, escape_log_text(value));
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        use std::fmt::Write as _;
+        let name = field.name();
+        if name == "message" {
+            self.message.clear();
+            let _ = write!(self.message, "{value}");
+            return;
+        }
+        self.push_field_sep();
+        let _ = write!(self.fields, "{name}={value}");
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        use std::fmt::Write as _;
+        let name = field.name();
+        if name == "message" {
+            self.message.clear();
+            let _ = write!(self.message, "{value}");
+            return;
+        }
+        self.push_field_sep();
+        let _ = write!(self.fields, "{name}={value}");
+    }
+
+    fn record_i128(&mut self, field: &tracing::field::Field, value: i128) {
+        use std::fmt::Write as _;
+        let name = field.name();
+        if name == "message" {
+            self.message.clear();
+            let _ = write!(self.message, "{value}");
+            return;
+        }
+        self.push_field_sep();
+        let _ = write!(self.fields, "{name}={value}");
+    }
+
+    fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
+        use std::fmt::Write as _;
+        let name = field.name();
+        if name == "message" {
+            self.message.clear();
+            let _ = write!(self.message, "{value}");
+            return;
+        }
+        self.push_field_sep();
+        let _ = write!(self.fields, "{name}={value}");
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        use std::fmt::Write as _;
+        let name = field.name();
+        if name == "message" {
+            self.message.clear();
+            let _ = write!(self.message, "{value}");
+            return;
+        }
+        self.push_field_sep();
+        let _ = write!(self.fields, "{name}={value}");
+    }
+
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        use std::fmt::Write as _;
+        let name = field.name();
+        if name == "message" {
+            self.message.clear();
+            let _ = write!(self.message, "{value}");
+            return;
+        }
+        self.push_field_sep();
+        let _ = write!(self.fields, "{name}={value}");
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         use std::fmt::Write as _;
         let name = field.name();
+        self.debug_buf.clear();
+        let _ = write!(self.debug_buf, "{value:?}");
+
         if name == "message" {
-            let val_str = format!("{value:?}");
-            *self.message = escape_log_text(&strip_debug_quotes(val_str)).to_string();
+            let inner = strip_debug_quotes_ref(self.debug_buf);
+            self.message.clear();
+            let _ = write!(self.message, "{}", escape_log_text(inner));
             return;
         }
-        if !self.fields.is_empty() {
-            self.fields.push(' ');
+
+        self.push_field_sep();
+        if is_single_escaped_quoted_str(self.debug_buf) {
+            // `{:?}` 已经生成了合法的单个带引号转义字面量（如 `user = ?"alice"`），直接输出避免外层引号二次转义为 `\"`
+            let _ = write!(self.fields, "{name}={}", self.debug_buf);
+        } else if self.debug_buf.is_empty()
+            || self
+                .debug_buf
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '=' | '\\'))
+        {
+            // 含空白、内部未转义引号或分隔符的值（如 `err = %io_err` 或恶意输入）统一包裹外层引号并转义，阻断字段注入
+            let _ = write!(
+                self.fields,
+                "{}=\"{}\"",
+                name,
+                escape_log_text(self.debug_buf)
+            );
+        } else {
+            let _ = write!(self.fields, "{}={}", name, escape_log_text(self.debug_buf));
         }
-        let value = format!("{value:?}");
-        let _ = write!(self.fields, "{}={}", name, escape_log_text(&value));
     }
+}
+
+fn with_text_scratch<R>(f: impl FnOnce(&mut TextScratch) -> R) -> R {
+    TEXT_SCRATCH.with(|cell| {
+        if let Ok(mut scratch) = cell.try_borrow_mut() {
+            scratch.clear();
+            let res = f(&mut scratch);
+            scratch.shrink_if_oversized();
+            res
+        } else {
+            let mut fallback = TextScratch::new();
+            f(&mut fallback)
+        }
+    })
 }
 
 impl<S, N> FormatEvent<S, N> for OwlFormatter
@@ -270,10 +605,10 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
-        use std::fmt::Write as _;
+        let sys_time = event_system_time(event);
 
         // 时间 | 级别 |（Compact 格式使用空格分隔）
-        self.write_timestamp(&mut writer)?;
+        self.write_timestamp(&mut writer, sys_time)?;
         if self.compact {
             write!(writer, " ")?;
         } else {
@@ -286,7 +621,7 @@ where
             self.write_separator(&mut writer)?;
         }
 
-        // Span 上下文信息（如 request req_id="req-001"）
+        // Span 上下文信息（如 request{req_id="req-001"}），直接流式写入 writer 避免临时 String 分配
         if let Some(scope) = ctx.event_scope() {
             let mut first = true;
             for span in scope.from_root() {
@@ -303,31 +638,28 @@ where
                 let ext = span.extensions();
                 if let Some(fields) = ext.get::<OwlSpanFields>() {
                     if !fields.0.is_empty() {
-                        let mut span_fields = String::new();
-                        for (k, v) in &fields.0 {
-                            if !span_fields.is_empty() {
-                                span_fields.push_str(", ");
+                        write!(writer, "{{")?;
+                        for (idx, (k, v)) in fields.0.iter().enumerate() {
+                            if idx > 0 {
+                                write!(writer, ", ")?;
                             }
                             match v {
                                 serde_json::Value::String(value) => {
-                                    let _ =
-                                        write!(span_fields, "{}=\"{}\"", k, escape_log_text(value));
+                                    write!(writer, "{}=\"{}\"", k, escape_log_text(value))?;
+                                }
+                                serde_json::Value::Number(num) => {
+                                    write!(writer, "{k}={num}")?;
+                                }
+                                serde_json::Value::Bool(flag) => {
+                                    write!(writer, "{k}={flag}")?;
                                 }
                                 value => {
-                                    let value = value.to_string();
-                                    let _ = write!(
-                                        span_fields,
-                                        "{}=\"{}\"",
-                                        k,
-                                        escape_log_text(&value)
-                                    );
+                                    let rendered = value.to_string();
+                                    write!(writer, "{}=\"{}\"", k, escape_log_text(&rendered))?;
                                 }
                             }
                         }
-
-                        if !span_fields.is_empty() {
-                            write!(writer, "{{{span_fields}}}")?;
-                        }
+                        write!(writer, "}}")?;
                     }
                 }
                 first = false;
@@ -390,44 +722,48 @@ where
             }
         }
 
-        // 提取日志消息与自定义字段
-        let mut message = String::new();
-        let mut fields_str = String::new();
-        let mut visitor = PrettyVisitor {
-            message: &mut message,
-            fields: &mut fields_str,
-        };
-        event.record(&mut visitor);
-
-        if self.enable_ansi {
-            let full_msg = if self.global_fields.is_empty() {
-                if fields_str.is_empty() {
-                    message
-                } else {
-                    format!("{message} {fields_str}")
-                }
-            } else if fields_str.is_empty() {
-                format!("{} {}", message, self.global_fields)
-            } else {
-                format!("{} {} {}", message, fields_str, self.global_fields)
+        // 复用 TLS 缓冲区提取日志消息与自定义字段
+        with_text_scratch(|scratch| -> fmt::Result {
+            let mut visitor = PrettyVisitor {
+                message: &mut scratch.message,
+                fields: &mut scratch.fields,
+                debug_buf: &mut scratch.debug_buf,
             };
+            event.record(&mut visitor);
 
-            let level = event.metadata().level();
-            match *level {
-                Level::ERROR => write!(writer, "{}", full_msg.red().bold())?,
-                Level::WARN => write!(writer, "{}", full_msg.yellow())?,
-                Level::INFO => write!(writer, "{full_msg}")?,
-                Level::DEBUG | Level::TRACE => write!(writer, "{}", full_msg.dimmed())?,
+            let message = &scratch.message;
+            let fields_str = &scratch.fields;
+
+            macro_rules! write_body {
+                ($args:expr) => {
+                    if self.enable_ansi {
+                        match *event.metadata().level() {
+                            Level::ERROR => write!(writer, "{}", $args.red().bold())?,
+                            Level::WARN => write!(writer, "{}", $args.yellow())?,
+                            Level::INFO => write!(writer, "{}", $args)?,
+                            Level::DEBUG | Level::TRACE => write!(writer, "{}", $args.dimmed())?,
+                        }
+                    } else {
+                        write!(writer, "{}", $args)?;
+                    }
+                };
             }
-        } else if fields_str.is_empty() && self.global_fields.is_empty() {
-            write!(writer, "{message}")?;
-        } else if self.global_fields.is_empty() {
-            write!(writer, "{message} {fields_str}")?;
-        } else if fields_str.is_empty() {
-            write!(writer, "{} {}", message, self.global_fields)?;
-        } else {
-            write!(writer, "{} {} {}", message, fields_str, self.global_fields)?;
-        }
+
+            if fields_str.is_empty() && self.global_fields.is_empty() {
+                write_body!(format_args!("{message}"));
+            } else if self.global_fields.is_empty() {
+                write_body!(format_args!("{message} {fields_str}"));
+            } else if fields_str.is_empty() {
+                write_body!(format_args!("{} {}", message, self.global_fields));
+            } else {
+                write_body!(format_args!(
+                    "{} {} {}",
+                    message, fields_str, self.global_fields
+                ));
+            }
+            Ok(())
+        })?;
+
         writeln!(writer)
     }
 }
@@ -439,65 +775,122 @@ pub struct OwlJsonFormatter {
     pub(crate) show_line_number: bool,
     pub(crate) time_format: String,
     pub(crate) use_utc: bool,
-    pub(crate) global_fields: HashMap<String, String>,
+    pub(crate) global_fields: Vec<(String, String)>,
 }
 
-struct JsonVisitor<'a> {
-    map: &'a mut serde_json::Map<String, serde_json::Value>,
+struct JsonStreamingVisitor<'a> {
+    scratch: &'a mut JsonScratch,
 }
 
-impl<'a> tracing::field::Visit for JsonVisitor<'a> {
+impl<'a> JsonStreamingVisitor<'a> {
+    #[inline]
+    fn target_buf(&mut self, field: &tracing::field::Field) -> &mut Vec<u8> {
+        if field.name() == "message" {
+            self.scratch.message_val.clear();
+            &mut self.scratch.message_val
+        } else {
+            self.scratch.write_unique_field_prefix(field.name());
+            &mut self.scratch.buf
+        }
+    }
+}
+
+impl<'a> tracing::field::Visit for JsonStreamingVisitor<'a> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        let name = field.name();
-        self.map.insert(
-            name.to_string(),
-            serde_json::Value::String(value.to_string()),
-        );
+        let out = self.target_buf(field);
+        let _ = serde_json::to_writer(out, value);
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        let name = field.name();
-        self.map.insert(
-            name.to_string(),
-            serde_json::Value::Number(serde_json::Number::from(value)),
-        );
+        use std::io::Write as _;
+        let out = self.target_buf(field);
+        let _ = write!(out, "{value}");
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        let name = field.name();
-        self.map.insert(
-            name.to_string(),
-            serde_json::Value::Number(serde_json::Number::from(value)),
-        );
+        use std::io::Write as _;
+        let out = self.target_buf(field);
+        let _ = write!(out, "{value}");
+    }
+
+    fn record_i128(&mut self, field: &tracing::field::Field, value: i128) {
+        use std::io::Write as _;
+        let out = self.target_buf(field);
+        match i64::try_from(value) {
+            Ok(narrow) => {
+                let _ = write!(out, "{narrow}");
+            }
+            Err(_) => {
+                let _ = write!(out, "\"{value}\"");
+            }
+        }
+    }
+
+    fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
+        use std::io::Write as _;
+        let out = self.target_buf(field);
+        match u64::try_from(value) {
+            Ok(narrow) => {
+                let _ = write!(out, "{narrow}");
+            }
+            Err(_) => {
+                let _ = write!(out, "\"{value}\"");
+            }
+        }
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        let name = field.name();
-        self.map
-            .insert(name.to_string(), serde_json::Value::Bool(value));
+        let out = self.target_buf(field);
+        out.extend_from_slice(if value { b"true" } else { b"false" });
     }
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        let name = field.name();
-        let val = if let Some(num) = serde_json::Number::from_f64(value) {
-            serde_json::Value::Number(num)
+        use std::fmt::Write as _;
+        if let Some(num) = serde_json::Number::from_f64(value) {
+            let out = self.target_buf(field);
+            let _ = serde_json::to_writer(out, &num);
         } else {
-            serde_json::Value::String(value.to_string())
-        };
-        self.map.insert(name.to_string(), val);
+            self.scratch.debug_buf.clear();
+            let _ = write!(&mut self.scratch.debug_buf, "{value}");
+            if field.name() == "message" {
+                self.scratch.message_val.clear();
+                let _ =
+                    serde_json::to_writer(&mut self.scratch.message_val, &self.scratch.debug_buf);
+            } else {
+                self.scratch.write_unique_field_prefix(field.name());
+                let _ = serde_json::to_writer(&mut self.scratch.buf, &self.scratch.debug_buf);
+            }
+        }
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        let name = field.name();
-        let val_str = format!("{value:?}");
-        let cleaned = if val_str.starts_with('"') && val_str.ends_with('"') && val_str.len() >= 2 {
-            val_str[1..val_str.len() - 1].to_string()
+        use std::fmt::Write as _;
+        self.scratch.debug_buf.clear();
+        let _ = write!(&mut self.scratch.debug_buf, "{value:?}");
+        if field.name() == "message" {
+            self.scratch.message_val.clear();
+            let cleaned = strip_debug_quotes_ref(&self.scratch.debug_buf);
+            let _ = serde_json::to_writer(&mut self.scratch.message_val, cleaned);
         } else {
-            val_str
-        };
-        self.map
-            .insert(name.to_string(), serde_json::Value::String(cleaned));
+            self.scratch.write_unique_field_prefix(field.name());
+            let cleaned = strip_debug_quotes_ref(&self.scratch.debug_buf);
+            let _ = serde_json::to_writer(&mut self.scratch.buf, cleaned);
+        }
     }
+}
+
+fn with_json_scratch<R>(f: impl FnOnce(&mut JsonScratch) -> R) -> R {
+    JSON_SCRATCH.with(|cell| {
+        if let Ok(mut scratch) = cell.try_borrow_mut() {
+            scratch.clear();
+            let res = f(&mut scratch);
+            scratch.shrink_if_oversized();
+            res
+        } else {
+            let mut fallback = JsonScratch::new();
+            f(&mut fallback)
+        }
+    })
 }
 
 impl<S, N> FormatEvent<S, N> for OwlJsonFormatter
@@ -511,109 +904,120 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
-        let mut log_obj = serde_json::Map::new();
+        use std::fmt::Write as _;
+        use std::io::Write as _;
 
-        // 1. 时间戳
-        let ts = if self.use_utc {
-            chrono::Utc::now().format(&self.time_format).to_string()
-        } else {
-            chrono::Local::now().format(&self.time_format).to_string()
-        };
-        log_obj.insert("timestamp".to_string(), serde_json::Value::String(ts));
+        let sys_time = event_system_time(event);
 
-        // 2. 级别
-        let level_str = event.metadata().level().to_string();
-        log_obj.insert("level".to_string(), serde_json::Value::String(level_str));
-
-        // 3. 来源模块
-        if self.show_target {
-            log_obj.insert(
-                "target".to_string(),
-                serde_json::Value::String(event.metadata().target().to_string()),
-            );
-        }
-
-        // 4. 线程信息
-        if self.show_thread {
-            let thread_name = std::thread::current()
-                .name()
-                .unwrap_or("unnamed")
-                .to_string();
-            log_obj.insert("thread".to_string(), serde_json::Value::String(thread_name));
-        }
-
-        // 5. 源码行号
-        if self.show_line_number {
-            if let Some(file) = event.metadata().file() {
-                log_obj.insert(
-                    "file".to_string(),
-                    serde_json::Value::String(file.to_string()),
+        with_json_scratch(|scratch| -> fmt::Result {
+            // 1. 时间戳（复用 ts_buf，零堆分配）
+            if self.use_utc {
+                let _ = write!(
+                    &mut scratch.ts_buf,
+                    "{}",
+                    chrono::DateTime::<chrono::Utc>::from(sys_time).format(&self.time_format)
+                );
+            } else {
+                let _ = write!(
+                    &mut scratch.ts_buf,
+                    "{}",
+                    chrono::DateTime::<chrono::Local>::from(sys_time).format(&self.time_format)
                 );
             }
-            if let Some(line) = event.metadata().line() {
-                log_obj.insert(
-                    "line".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(line)),
-                );
+            scratch.buf.extend_from_slice(b"{\"timestamp\":");
+            let _ = serde_json::to_writer(&mut scratch.buf, &scratch.ts_buf);
+
+            // 2. 级别（纯 ASCII 常量）
+            scratch.buf.extend_from_slice(b",\"level\":\"");
+            scratch
+                .buf
+                .extend_from_slice(event.metadata().level().as_str().as_bytes());
+            scratch.buf.push(b'"');
+
+            // 3. 来源模块
+            if self.show_target {
+                scratch.buf.extend_from_slice(b",\"target\":");
+                let _ = serde_json::to_writer(&mut scratch.buf, event.metadata().target());
             }
-        }
 
-        // 6. 收集 Event 字段
-        let mut fields_map = serde_json::Map::new();
-        let mut visitor = JsonVisitor {
-            map: &mut fields_map,
-        };
-        event.record(&mut visitor);
+            // 4. 线程信息
+            if self.show_thread {
+                let thread = std::thread::current();
+                let thread_name = thread.name().unwrap_or("unnamed");
+                scratch.buf.extend_from_slice(b",\"thread\":");
+                let _ = serde_json::to_writer(&mut scratch.buf, thread_name);
+            }
 
-        // 提取并移出 message
-        if let Some(msg_val) = fields_map.remove("message") {
-            log_obj.insert("message".to_string(), msg_val);
-        } else {
-            log_obj.insert(
-                "message".to_string(),
-                serde_json::Value::String("".to_string()),
-            );
-        }
+            // 5. 源码行号
+            if self.show_line_number {
+                if let Some(file) = event.metadata().file() {
+                    scratch.buf.extend_from_slice(b",\"file\":");
+                    let _ = serde_json::to_writer(&mut scratch.buf, file);
+                }
+                if let Some(line) = event.metadata().line() {
+                    let _ = write!(&mut scratch.buf, ",\"line\":{line}");
+                }
+            }
 
-        // 7. 事件自定义字段优先平铺；冲突时保留全部来源而不是覆盖。
-        for (key, value) in fields_map {
-            insert_json_field(&mut log_obj, &key, value);
-        }
+            // 6. 单遍流式写入 Event 自定义字段，并捕获 message
+            let mut visitor = JsonStreamingVisitor { scratch };
+            event.record(&mut visitor);
 
-        // 8. Span 链上下文信息合并到顶层（包含 req_id 等）
-        if let Some(scope) = ctx.event_scope() {
-            for span in scope.from_root() {
-                let ext = span.extensions();
-                if let Some(fields) = ext.get::<OwlSpanFields>() {
-                    for (k, v) in &fields.0 {
-                        insert_json_field(&mut log_obj, k, v.clone());
+            scratch.buf.extend_from_slice(b",\"message\":");
+            if scratch.message_val.is_empty() {
+                scratch.buf.extend_from_slice(b"\"\"");
+            } else {
+                scratch.buf.extend_from_slice(&scratch.message_val);
+            }
+
+            // 7. Span 链上下文信息合并到顶层（由内层活跃子 Span 向外层根 Span 遍历，直接引用序列化，零 Value::clone）
+            if let Some(scope) = ctx.event_scope() {
+                for span in scope {
+                    let ext = span.extensions();
+                    if let Some(fields) = ext.get::<OwlSpanFields>() {
+                        for (k, v) in &fields.0 {
+                            scratch.write_unique_field_prefix(k);
+                            let _ = serde_json::to_writer(&mut scratch.buf, v);
+                        }
                     }
                 }
             }
-        }
 
-        // 9. 全局字段合并到顶层
-        for (k, v) in &self.global_fields {
-            insert_json_field(&mut log_obj, k, serde_json::Value::String(v.clone()));
-        }
+            // 8. 预排序的全局字段合并到顶层（顺序稳定可预期，零克隆）
+            for (k, v) in &self.global_fields {
+                scratch.write_unique_field_prefix(k);
+                let _ = serde_json::to_writer(&mut scratch.buf, v);
+            }
 
-        write!(writer, "{}", serde_json::Value::Object(log_obj))?;
-        writeln!(writer)
+            scratch.buf.push(b'}');
+
+            let json_str = std::str::from_utf8(&scratch.buf).map_err(|_| fmt::Error)?;
+            writer.write_str(json_str)?;
+            writeln!(writer)
+        })
+    }
+}
+
+pub(crate) fn json_formatter(config: &OwlConfig) -> OwlJsonFormatter {
+    OwlJsonFormatter {
+        show_target: config.show_target,
+        show_thread: config.show_thread,
+        show_line_number: config.show_line_number,
+        time_format: config.time_format.clone(),
+        use_utc: config.use_utc,
+        global_fields: sorted_json_global_fields(&config.global_fields),
     }
 }
 
 /// 用于文件输出的无色 Pretty 格式化器（禁用 ANSI 转义序列）
-pub(crate) fn file_formatter(
-    language: Language,
-    config: &crate::config::OwlConfig,
-) -> OwlFormatter {
+pub(crate) fn file_formatter(language: Language, config: &OwlConfig) -> OwlFormatter {
     OwlFormatter {
         language,
         compact: false,
         show_target: config.show_target,
         show_thread: config.show_thread,
         show_line_number: config.show_line_number,
-        enable_ansi: false, // 文件输出不带颜色
+        enable_ansi: false,
         time_format: config.time_format.clone(),
         use_utc: config.use_utc,
         global_fields: format_global_fields(&config.global_fields),
@@ -621,10 +1025,7 @@ pub(crate) fn file_formatter(
 }
 
 /// 用于控制台输出的彩色 Pretty 格式化器
-pub(crate) fn console_formatter(
-    language: Language,
-    config: &crate::config::OwlConfig,
-) -> OwlFormatter {
+pub(crate) fn console_formatter(language: Language, config: &OwlConfig) -> OwlFormatter {
     OwlFormatter {
         language,
         compact: false,
@@ -639,13 +1040,7 @@ pub(crate) fn console_formatter(
 }
 
 /// 用于文件输出的无色 Compact 格式化器。
-///
-/// Compact 也必须经过 owl-logger 的字段访问器，保证全局字段与 Pretty/JSON 输出保持
-/// 一致，不能回退到 tracing-subscriber 的默认格式化器。
-pub(crate) fn file_compact_formatter(
-    language: Language,
-    config: &crate::config::OwlConfig,
-) -> OwlFormatter {
+pub(crate) fn file_compact_formatter(language: Language, config: &OwlConfig) -> OwlFormatter {
     OwlFormatter {
         language,
         compact: true,
@@ -660,10 +1055,7 @@ pub(crate) fn file_compact_formatter(
 }
 
 /// 用于控制台输出的 Compact 格式化器。
-pub(crate) fn console_compact_formatter(
-    language: Language,
-    config: &crate::config::OwlConfig,
-) -> OwlFormatter {
+pub(crate) fn console_compact_formatter(language: Language, config: &OwlConfig) -> OwlFormatter {
     OwlFormatter {
         language,
         compact: true,
@@ -682,10 +1074,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strip_debug_quotes_removes_outer_quotes_only() {
+    fn strip_debug_quotes_removes_outer_quotes_only_for_single_quoted_literal() {
         assert_eq!(strip_debug_quotes("\"req-001\"".to_string()), "req-001");
         assert_eq!(strip_debug_quotes("42".to_string()), "42");
         assert_eq!(strip_debug_quotes("\"\"".to_string()), "");
+        assert_eq!(
+            strip_debug_quotes("\"hello \\\"world\\\"\"".to_string()),
+            "hello \\\"world\\\""
+        );
+        // 包含多个未转义引号片段的普通字符串绝不能剥掉首尾引号导致配对损坏或字段注入
+        assert_eq!(
+            strip_debug_quotes("\"quoted\" and \"more\"".to_string()),
+            "\"quoted\" and \"more\""
+        );
+        assert_eq!(
+            strip_debug_quotes("\"guest\" role=\"admin\"".to_string()),
+            "\"guest\" role=\"admin\""
+        );
+        // 末尾引号被反斜杠转义时不是闭合字面量
+        assert!(!is_single_escaped_quoted_str("\"dangling\\\""));
+        // 含原始控制字符时不是合法 Debug 字符串字面量
+        assert!(!is_single_escaped_quoted_str("\"line1\nline2\""));
     }
 
     #[test]
